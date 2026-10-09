@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>beatgrid listen</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <strong>beatgrid</strong><span class="muted">listen</span>
+  <select id="set"></select>
+  <select id="filter">
+    <option value="all">all tracks</option>
+    <option value="fail">beatgrid not usable @10 ms</option>
+    <option value="disagree">beatgrid ≠ reference</option>
+    <option value="review">flagged for review</option>
+    <option value="drifts">reference drifts (audit)</option>
+    <option value="unjudged">no verdict yet</option>
+  </select>
+  <select id="split"><option value="">dev + test</option><option value="dev">dev</option><option value="test">test</option></select>
+  <input id="search" type="search" placeholder="search title / artist">
+  <span id="count" class="muted"></span>
+</header>
+<main>
+  <aside><ol id="list"></ol></aside>
+  <section id="track" class="empty">
+    <div id="placeholder">Pick a track. Space plays; the clicks show where each grid says the beat is.</div>
+    <div id="content" hidden>
+      <div class="titlebar">
+        <div>
+          <div id="title"></div>
+          <div id="subtitle" class="muted"></div>
+        </div>
+        <div id="badges"></div>
+      </div>
+      <canvas id="overview" height="70"></canvas>
+      <canvas id="detail" height="300"></canvas>
+      <div id="readout" class="mono"></div>
+      <div class="controls">
+        <button id="play" title="Space">▶ play</button>
+        <button id="prevbar" title="Shift+←">⟨ bar</button>
+        <button id="nextbar" title="Shift+→">bar ⟩</button>
+        <button id="prevdis" title="P">⟨ disagreement</button>
+        <button id="nextdis" title="N">disagreement ⟩</button>
+        <span class="sep"></span>
+        <label>clicks
+          <select id="clickmode" title="C cycles">
+            <option value="split">reference ← | → beatgrid</option>
+            <option value="beatgrid">beatgrid only</option>
+            <option value="reference">reference only</option>
+            <option value="engine">Engine default only</option>
+            <option value="off">off</option>
+          </select>
+        </label>
+        <label>click <input id="clickvol" type="range" min="0" max="1" step="0.01" value="0.6"></label>
+        <label>music <input id="musicvol" type="range" min="0" max="1" step="0.01" value="0.8"></label>
+        <label>zoom <input id="zoom" type="range" min="0" max="1" step="0.001" value="0.3"></label>
+        <label><input id="showflux" type="checkbox" checked> attack curve</label>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--ref)"></i>reference (top half)</span>
+        <span><i style="background:var(--ours)"></i>beatgrid (bottom half)</span>
+        <span><i style="background:var(--engine)"></i>Engine default (top strip)</span>
+        <span><i style="background:var(--raw)"></i>Beat This! raw (bottom strip)</span>
+        <span class="muted">thick line = bar 1 · wheel to zoom · click to seek · ←/→ beat</span>
+      </div>
+      <div class="verdict">
+        <span>Which grid is right?</span>
+        <button data-v="beatgrid">beatgrid</button>
+        <button data-v="reference">reference</button>
+        <button data-v="both">both fine</button>
+        <button data-v="neither">neither</button>
+        <input id="note" placeholder="note (optional): e.g. bar 1 is on the snare">
+        <span id="saved" class="muted"></span>
+      </div>
+      <table id="scores" class="mono"></table>
+      <div id="diag" class="muted mono"></div>
+    </div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

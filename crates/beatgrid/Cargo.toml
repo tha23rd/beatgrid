@@ -1,0 +1,22 @@
+[package]
+name = "beatgrid"
+description = "DJ-grade beat grids: exact tempo, beats on the attack, bar 1 on the one"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories = ["multimedia::audio"]
+
+[dependencies]
+anyhow = "1"
+matrixmultiply = { version = "0.3", features = ["threading"] }
+rayon = "1"
+realfft = "3.5"
+rubato = "5"
+safetensors = "0.8"
+serde = { version = "1", features = ["derive"] }
+symphonia = { version = "0.6", features = ["all-codecs", "all-formats"] }

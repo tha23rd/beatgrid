@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/beatgrid", "crates/beatgrid-cli", "crates/beatgrid-py"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tha23rd/beatgrid"
+homepage = "https://github.com/tha23rd/beatgrid"
+rust-version = "1.87"
+keywords = ["beat-tracking", "bpm", "dj", "audio", "music"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

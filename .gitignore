@@ -1,0 +1,11 @@
+/data/
+/target/
+__pycache__/
+*.pyc
+.venv*/
+.pytest_cache/
+/research/runs/
+# Python bindings: wheels, and the extension maturin develop builds in place
+/crates/beatgrid-py/dist/
+/crates/beatgrid-py/python/beatgrid/*.so
+/crates/beatgrid-py/python/beatgrid/*.pyd

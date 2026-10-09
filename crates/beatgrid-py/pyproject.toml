@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "beatgrid"
+description = "DJ-grade beat grids: exact tempo, beats on the attack, bar 1 on the one"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["beat-tracking", "bpm", "dj", "audio", "music"]
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+]
+
+[project.urls]
+Homepage = "https://github.com/tha23rd/beatgrid"
+Repository = "https://github.com/tha23rd/beatgrid"
+
+[tool.maturin]
+python-source = "python"
+module-name = "beatgrid._beatgrid"
