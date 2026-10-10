@@ -28,17 +28,22 @@ if grid:
 print(r["review"])                              # [] when nothing looked doubtful
 
 results = beatgrid.analyze_many(["a.mp3", "b.flac"], profile="edm")
+
+r = beatgrid.analyze("edit.mp3", tempo="auto")  # segments where the tempo clearly changes
+for s in r["grid"]["segments"]:                 # {"start", "bpm", "beat_in_bar", "beat", "bar"}
+    print(s["start"], s["bpm"])
 ```
 
-`analyze(path, profile="none")` returns a dict:
+`analyze(path, profile="none", tempo="constant")` returns a dict:
 
 | key | value |
 |---|---|
 | `grid` | `None` when there is no steady beat, otherwise a dict: |
-| `grid["bpm"]` | one constant tempo; a whole or half BPM when the audio agrees |
-| `grid["first_beat"]` | time (s) of the first beat at or after 0 s |
+| `grid["bpm"]` | the best single tempo; a whole or half BPM when the audio agrees |
+| `grid["first_beat"]` | time (s) of the first beat at or after 0 s, on that single-tempo grid |
 | `grid["first_downbeat"]` | time (s) of the first downbeat at or after 0 s: bar 1 |
-| `grid["beats"]` | every beat time (s) from 0 to the end of the track |
+| `grid["segments"]` | the grid as constant-tempo segments, each `{"start", "bpm", "beat_in_bar", "beat", "bar"}` (time of its first beat, tempo, where that beat falls in its bar, and its beat and bar numbers): several where the tempo changes (`tempo="auto"` or `"variable"`), otherwise one |
+| `grid["beats"]` | every beat time (s) from 0 to the end of the track, following the segments |
 | `grid["is_downbeat"]` | for each beat, whether it is beat 1 of a bar |
 | `duration` | length of the decoded audio (s) |
 | `review` | reasons to check the grid by ear (e.g. `"tempo may change"`, `"bar 1 unclear: the downbeat cues disagree"`); empty when nothing looked doubtful |
@@ -47,7 +52,13 @@ results = beatgrid.analyze_many(["a.mp3", "b.flac"], profile="edm")
 Profiles: `"none"` (or `"default"`) keeps the tempo octave the audio suggests; `"edm"` counts
 drum & bass in half time and folds everything else into 100–200 BPM.
 
-`analyze_many(paths, profile="none")` grids files in parallel (the GIL is released) and
+Tempo modes: `"constant"` (the default) gives one tempo per track; `"auto"` splits the grid
+into constant-tempo segments where the track clearly changes tempo (a transition edit, a
+mashup) and keeps one tempo everywhere else; `"variable"` looks harder and also follows a
+phase jump at the same tempo, for tracks you know change. A segmented grid's only review
+reason is `"tempo changes: check the grid where it changes"`.
+
+`analyze_many(paths, profile="none", tempo="constant")` grids files in parallel (the GIL is released) and
 returns a list in the same order; a file that fails gives `{"error": message}` instead of
 raising.
 

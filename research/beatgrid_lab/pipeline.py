@@ -87,12 +87,39 @@ class Params:
     # bass at 165–185, say) is counted at half of it, as many DJs do.
     octave_range: tuple | None = None
     octave_half_range: tuple | None = None
+    # Tempo changes (sections.py): "constant" keeps one tempo; "variable" and "auto" split the
+    # grid into constant-tempo segments where the track changes tempo, "auto" only on strong
+    # evidence. The seg_* knobs tune the search.
+    tempo: str = "constant"
+    seg_window_s: float = 16.0  # windows the local tempo is measured in
+    seg_hop_s: float = 4.0
+    seg_step: float = 0.005  # between tempo states (fraction)
+    seg_drift_cost: float = 0.5  # log units: moving one tempo state between windows
+    seg_switch_cost: float = 8.0  # jumping further
+    seg_quiet: float = 0.3  # windows whose coherence peaks below this carry no evidence
+    seg_anchor_min: float = 0.3  # an anchor needs this much coherence at its window's tempo
+    seg_sigma_ms: float = 4.0  # anchor noise for the line costs
+    seg_clip: float = 3.0  # anchors further off than this many sigmas cost no more
+    seg_min_anchors: int = 4  # a segment spans at least this many anchors
+    seg_search_span: float = 0.01  # tempo search around a segment's line (fraction)
+    seg_join_s: float = 8.0  # a change is placed within this far of where the lines meet
+    # What a segmentation must show to be taken (defaults: "auto"; TEMPO_MODES has "variable").
+    seg_penalty: float = 24.0  # cost of an extra line through the anchors
+    seg_min_tempo_change: float = 0.001  # (fraction) a join with less is no change...
+    seg_min_jump: float = 0.0  # ... unless a same-tempo phase jump of at least this (beats; 0: never)
+    seg_min_bars: float = 16.0  # every segment holds at least this many bars
+    seg_min_apart: int = 64  # beats where the segmented grid is more than 10 ms from the constant one
+    seg_margin: float = 0.25  # how much stronger the attacks on those beats must be under it
+    seg_min_evidence: float = 2.5  # ... and how strong, over the track's median flux
 
 
 @dataclass
 class Result:
     grid: Grid | None
     diagnostics: dict = field(default_factory=dict)
+    # The grid in constant-tempo segments when the tempo changes (params.tempo "variable" or
+    # "auto"); None when one tempo holds.
+    segments: "object | None" = None
 
 
 def coarse_bpm(act: Activations, params: Params) -> float | None:
@@ -382,6 +409,7 @@ TEMPO_CHANGE = "tempo may change"
 BAR_DISAGREE = "bar 1 unclear: the downbeat cues disagree"
 OCTAVE_HALVED = "octave chosen by the profile: the audio's pulse is twice as fast"
 OCTAVE_DOUBLED = "octave chosen by the profile: the audio's pulse is half as fast"
+TEMPO_SEGMENTS = "tempo changes: check the grid where it changes"
 
 
 def review_reasons(diag: dict) -> list[str]:
@@ -389,7 +417,10 @@ def review_reasons(diag: dict) -> list[str]:
     Measured with experiments/review_flags.py; what each reason catches and costs, and the
     signals that were tried and not kept (a second attack, a grid that walks off the attacks,
     a narrow bar-1 margin), are in docs/results.md. Those signals stay in the diagnostics
-    (attack_second, stretch_drift_ms, snap_drift_ms, bar_margin)."""
+    (attack_second, stretch_drift_ms, snap_drift_ms, bar_margin). A grid in segments gets one
+    reason, to check the joins: the others describe a single-tempo grid."""
+    if diag.get("segmented"):
+        return [TEMPO_SEGMENTS]
     reasons = []
     # No usable attack: the audio could not refine the tempo, or under the final grid fewer
     # than 3 of the track's 8 stretches show one.
@@ -407,6 +438,14 @@ def review_reasons(diag: dict) -> list[str]:
         reasons.append(OCTAVE_HALVED if diag["bpm_grid"] < diag["bpm"] else OCTAVE_DOUBLED)
     return reasons
 
+
+# The knobs each tempo mode sets (on top of the defaults, which are "auto"'s).
+TEMPO_MODES = {
+    "constant": {"tempo": "constant"},
+    "auto": {"tempo": "auto"},
+    "variable": {"tempo": "variable", "seg_penalty": 12.0, "seg_min_tempo_change": 0.0005, "seg_min_jump": 0.1,
+                 "seg_min_bars": 4.0, "seg_min_apart": 16, "seg_margin": 0.05, "seg_min_evidence": 1.5},
+}
 
 PROFILES = {
     # Drum & bass in half time, everything else between 100 and 200.
@@ -523,6 +562,15 @@ def run(track, params: Params = Params(), prior: Grid | None = None) -> Result:
     diag["bpm_grid"] = out_bpm
     diag["review"] = review_reasons(diag)
     downbeat = t0 + phase * period
+    segments = None
+    if params.tempo in ("variable", "auto"):
+        from .sections import fit as fit_sections, with_octave
+
+        found, diag["sections"] = fit_sections(track, act, params, bpm, downbeat)
+        if found is not None:
+            segments = with_octave(found, params)
+            diag["segmented"] = True
+            diag["review"] = review_reasons(diag)
     if params.follow_bends and worst > params.bend_ms and len(offsets) >= 3:
         # Markers at each stretch's centre, at the offset that stretch measured.
         k = np.round((centres - downbeat) / period)
@@ -533,4 +581,4 @@ def run(track, params: Params = Params(), prior: Grid | None = None) -> Result:
         if keep.sum() >= 2:
             grid = Grid(numbers[keep], times[keep])
             return Result(grid if out_bpm == bpm else Grid.constant(out_bpm, downbeat), diag)
-    return Result(Grid.constant(out_bpm, downbeat), diag)
+    return Result(Grid.constant(out_bpm, downbeat), diag, segments)

@@ -4,6 +4,7 @@
   uv run lab cache --set engine                 # Beat This! activations for every track
   uv run lab audit --set engine                 # which reference grids hold steady on their audio
   uv run lab eval --set engine --split dev -p offset_ms=2
+  uv run lab splices                            # synthetic tempo changes (splices.py), features cached
   uv run lab review                             # listen to grids in a browser (port 8765)
 """
 
@@ -257,6 +258,44 @@ def cmd_eval(args):
     print(f"\nper-track results: {out}")
 
 
+def _splice_features(job) -> str:
+    """Every feature of one splice: rendered in memory, nothing but the features written."""
+    import torch
+
+    from .splices import Splice, SpliceTrack
+
+    record, by_id, network = job
+    torch.set_num_threads(2)
+    t = SpliceTrack(Splice(record, by_id))
+    t.activations_for(network)
+    t.flux()
+    t.band_energy()
+    t.music_span
+    return record["id"]
+
+
+def cmd_splices(args):
+    import multiprocessing
+
+    from . import splices
+
+    pool_sources = splices.sources()
+    records = []
+    for split, count, seed in (("dev", args.dev, args.seed), ("test", args.test, args.seed + 1)):
+        mine = [s for s in pool_sources if s.split == split]
+        records += splices.build(mine, count, split, seed)
+        print(f"{split}: {sum(r['split'] == split for r in records)} splices from {len(mine)} sources")
+    path = splices.save(records)
+    print(f"-> {path}")
+    by_id = {s.id: s for s in pool_sources}
+    started = time.time()
+    ctx = multiprocessing.get_context("spawn")  # torch in forked workers deadlocks
+    with ProcessPoolExecutor(max_workers=args.jobs, mp_context=ctx) as pool:
+        for i, _ in enumerate(pool.map(_splice_features, [(r, by_id, args.network) for r in records]), 1):
+            if i % 20 == 0 or i == len(records):
+                print(f"features {i}/{len(records)}  {time.time() - started:.0f}s", flush=True)
+
+
 def cmd_review(args):
     from .review.server import serve
 
@@ -308,6 +347,14 @@ def main():
     p.add_argument("--label")
     p.add_argument("--jobs", type=int, default=12)
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("splices", help="build the synthetic tempo-change set and cache its features")
+    p.add_argument("--dev", type=int, default=240)
+    p.add_argument("--test", type=int, default=120)
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--network", default="student-v4")
+    p.add_argument("--jobs", type=int, default=7)
+    p.set_defaults(func=cmd_splices)
 
     p = sub.add_parser("review", help="web app to listen to grids and record verdicts")
     p.add_argument("--host", default="0.0.0.0")

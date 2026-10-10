@@ -42,9 +42,12 @@ class Decision:
     votes: dict = field(default_factory=dict)
 
 
-def beat_frames(bpm: float, t0: float, duration: float) -> tuple[np.ndarray, np.ndarray]:
+def beat_frames(bpm: float, t0: float, duration: float, span: tuple | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Beat indices (from t0) and times of a grid over [0, duration], or over `span` (lo, hi)
+    when given: one section of a track whose tempo changes."""
     period = 60.0 / bpm
-    k = np.arange(np.ceil(-t0 / period), np.floor((duration - t0) / period) + 1).astype(int)
+    lo, hi = span if span is not None else (0.0, duration)
+    k = np.arange(np.ceil((lo - t0) / period), np.floor((hi - t0) / period) + 1).astype(int)
     return k, t0 + k * period
 
 
@@ -61,11 +64,14 @@ def at_beats(values: np.ndarray, dt: float, times: np.ndarray, spread: int = 1) 
     return values[idx].max(axis=1)
 
 
-def per_beat(values: np.ndarray, dt: float, starts: np.ndarray) -> np.ndarray:
-    """Mean of `values` (frames x bands) over each beat interval."""
+def per_beat(values: np.ndarray, dt: float, starts: np.ndarray, until: float | None = None) -> np.ndarray:
+    """Mean of `values` (frames x bands) over each beat interval (the last one ends at `until`,
+    or at the end of the track)."""
     centres = (np.arange(len(values)) + 1) * dt
     which = np.searchsorted(starts, centres) - 1
     ok = (which >= 0) & (which < len(starts))
+    if until is not None:
+        ok &= centres < until
     sums = np.zeros((len(starts),) + values.shape[1:])
     counts = np.zeros(len(starts))
     np.add.at(sums, which[ok], values[ok])
@@ -77,27 +83,28 @@ def fold4(values: np.ndarray, k: np.ndarray) -> np.ndarray:
     return np.array([values[np.mod(k, 4) == r].mean() if np.any(np.mod(k, 4) == r) else 0.0 for r in range(4)])
 
 
-def vote_network(act, bpm: float, t0: float) -> np.ndarray:
-    k, times = beat_frames(bpm, t0, act.times[-1])
+def vote_network(act, bpm: float, t0: float, span: tuple | None = None) -> np.ndarray:
+    k, times = beat_frames(bpm, t0, act.times[-1], span)
     frames = np.clip(np.round(times * act.fps).astype(int)[:, None] + np.arange(-1, 2)[None, :], 0, len(act.downbeat) - 1)
     return fold4(act.downbeat[frames].max(axis=1), k)
 
 
-def vote_backbeat(energy: np.ndarray, dt: float, bpm: float, t0: float, active: np.ndarray) -> np.ndarray:
+def vote_backbeat(energy: np.ndarray, dt: float, bpm: float, t0: float, active: np.ndarray,
+                  span: tuple | None = None) -> np.ndarray:
     """Rotation r puts snares on r+1 and r+3."""
-    k, times = beat_frames(bpm, t0, len(energy) * dt)
+    k, times = beat_frames(bpm, t0, len(energy) * dt, span)
     snare = at_beats(onsets(energy)[:, SNARE_BANDS].sum(axis=1), dt, times)
     s = fold4(np.where(active[: len(k)], snare, 0.0), k) + 1e-9
     return np.array([(s[(r + 1) % 4] + s[(r + 3) % 4]) / (s[r] + s[(r + 2) % 4]) for r in range(4)])
 
 
-def vote_changes(energy: np.ndarray, dt: float, bpm: float, t0: float, top: int = 12) -> np.ndarray:
+def vote_changes(energy: np.ndarray, dt: float, bpm: float, t0: float, top: int = 12, span: tuple | None = None) -> np.ndarray:
     """The `top` biggest beat-to-beat steps in loudness and brightness, by the beat they land
     on; a rotation scores the steps it puts on bar 1."""
-    k, starts = beat_frames(bpm, t0, len(energy) * dt)
+    k, starts = beat_frames(bpm, t0, len(energy) * dt, span)
     if len(k) < 32:
         return np.ones(4)
-    beats = per_beat(energy, dt, starts)
+    beats = per_beat(energy, dt, starts, span[1] if span is not None else None)
     level = np.log(np.exp(beats).sum(axis=1) + 1e-9)
     weights = np.exp(beats)
     centroid = (weights * np.arange(beats.shape[1])).sum(axis=1) / (weights.sum(axis=1) + 1e-9)
@@ -117,14 +124,15 @@ def vote_changes(energy: np.ndarray, dt: float, bpm: float, t0: float, top: int 
     return votes + 1e-3 * votes.sum()
 
 
-def vote_fills(energy: np.ndarray, dt: float, bpm: float, t0: float, top: int = 16) -> np.ndarray:
+def vote_fills(energy: np.ndarray, dt: float, bpm: float, t0: float, top: int = 16, span: tuple | None = None) -> np.ndarray:
     """High-frequency onset bursts — crashes and new hat patterns — by the beat they land on;
     a rotation scores bursts on its bar 1. (Read the other way, as fills on the beat before
     the one, they were worse than chance on Raveform: 18%.)"""
-    k, starts = beat_frames(bpm, t0, len(energy) * dt)
+    k, starts = beat_frames(bpm, t0, len(energy) * dt, span)
     if len(k) < 32:
         return np.ones(4)
-    density = per_beat(onsets(energy)[:, CLICK_BANDS].sum(axis=1)[:, None], dt, starts)[:, 0]
+    density = per_beat(onsets(energy)[:, CLICK_BANDS].sum(axis=1)[:, None], dt, starts,
+                       span[1] if span is not None else None)[:, 0]
     local = density - np.convolve(density, np.ones(16) / 16, mode="same")
     votes = np.zeros(4)
     for i in np.argsort(local)[::-1][:top]:
@@ -142,18 +150,20 @@ def vote_prior(prior, bpm: float, t0: float, duration: float) -> np.ndarray:
     return fold4(on.astype(float), k) + 0.05
 
 
-def decide(track, act, bpm: float, t0: float, weights: Weights = Weights(), prior=None) -> Decision:
+def decide(track, act, bpm: float, t0: float, weights: Weights = Weights(), prior=None,
+           span: tuple | None = None) -> Decision:
+    """Bar 1 for a grid at bpm through t0, from the whole track or from `span` (lo, hi) of it."""
     energy, dt = track.band_energy()
     duration = len(energy) * dt
-    k, times = beat_frames(bpm, t0, duration)
+    k, times = beat_frames(bpm, t0, duration, span)
     # Energetic beats only for the pattern votes: breakdowns have no backbeat to read.
     level = at_beats(np.log(np.exp(energy).sum(axis=1)), dt, times, spread=2)
     active = level > np.percentile(level, 40)
     votes = {
-        "network": vote_network(act, bpm, t0),
-        "backbeat": vote_backbeat(energy, dt, bpm, t0, active),
-        "changes": vote_changes(energy, dt, bpm, t0),
-        "fills": vote_fills(energy, dt, bpm, t0),
+        "network": vote_network(act, bpm, t0, span),
+        "backbeat": vote_backbeat(energy, dt, bpm, t0, active, span),
+        "changes": vote_changes(energy, dt, bpm, t0, span=span),
+        "fills": vote_fills(energy, dt, bpm, t0, span=span),
         "prior": vote_prior(prior, bpm, t0, duration),
     }
     pooled = np.zeros(4)

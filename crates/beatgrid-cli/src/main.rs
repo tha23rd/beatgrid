@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use beatgrid::{Analysis, Analyzer, Options, Profile};
+use beatgrid::{Analysis, Analyzer, Options, Profile, SegmentedGrid, TempoMode};
 use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -24,6 +24,7 @@ const PROGRESS_MIN_FILES: usize = 8;
     after_help = "Examples:\n  \
         beatgrid analyze track.mp3 other.flac\n  \
         beatgrid analyze --profile edm --format csv music/*.mp3 > grids.csv\n  \
+        beatgrid analyze --tempo auto edit.mp3\n  \
         beatgrid beats track.mp3 > beats.csv"
 )]
 struct Cli {
@@ -41,7 +42,8 @@ enum Command {
     #[command(after_help = "Examples:\n  \
         beatgrid analyze track.mp3 other.flac\n  \
         beatgrid analyze --profile edm music/*.mp3 > grids.jsonl\n  \
-        beatgrid analyze --format csv --jobs 4 *.flac > grids.csv")]
+        beatgrid analyze --format csv --jobs 4 *.flac > grids.csv\n  \
+        beatgrid analyze --tempo auto edit.mp3")]
     Analyze {
         /// Audio files: MP3, FLAC, WAV, Ogg Vorbis, AAC or ALAC (MP4)
         #[arg(required = true)]
@@ -52,6 +54,9 @@ enum Command {
         /// Tempo octave convention
         #[arg(long, value_enum, default_value_t = ProfileArg::Default)]
         profile: ProfileArg,
+        /// Whether the grid may change tempo
+        #[arg(long, value_enum, default_value_t = TempoArg::Constant)]
+        tempo: TempoArg,
         /// Worker threads [default: one per CPU]
         #[arg(long, short)]
         jobs: Option<usize>,
@@ -59,13 +64,17 @@ enum Command {
         /// instead of running the network, to check the fit against the research pipeline.
         #[arg(long, value_name = "DIR", hide = true)]
         activations_dir: Option<PathBuf>,
+        /// Set a fit parameter (research): --param seg_penalty=20
+        #[arg(long = "param", value_name = "KEY=VALUE", hide = true)]
+        params: Vec<String>,
     },
     /// Every beat of a track: time (s), bar number, and position in the bar (1 = downbeat).
     ///
     /// Bar 1 starts at the first downbeat at or after time 0; beats before it are bar 0.
     #[command(after_help = "Examples:\n  \
         beatgrid beats track.mp3 > beats.csv\n  \
-        beatgrid beats --format json --profile edm track.flac")]
+        beatgrid beats --format json --profile edm track.flac\n  \
+        beatgrid beats --tempo auto edit.mp3")]
     Beats {
         /// An audio file
         file: PathBuf,
@@ -75,6 +84,9 @@ enum Command {
         /// Tempo octave convention
         #[arg(long, value_enum, default_value_t = ProfileArg::Default)]
         profile: ProfileArg,
+        /// Whether the grid may change tempo
+        #[arg(long, value_enum, default_value_t = TempoArg::Constant)]
+        tempo: TempoArg,
     },
     /// Decode to mono f32le on stdout (for checking the timeline against ffmpeg).
     #[command(hide = true)]
@@ -117,14 +129,27 @@ enum ProfileArg {
     Edm,
 }
 
-impl From<ProfileArg> for Options {
-    fn from(p: ProfileArg) -> Self {
-        Options {
-            profile: match p {
-                ProfileArg::Default => Profile::Default,
-                ProfileArg::Edm => Profile::Edm,
-            },
-        }
+#[derive(Clone, Copy, ValueEnum)]
+enum TempoArg {
+    /// One tempo for the whole track
+    Constant,
+    /// Constant-tempo segments where the track clearly changes tempo (edits, mashups)
+    Auto,
+    /// Segments wherever the evidence suggests a change: for tracks known to change tempo
+    Variable,
+}
+
+fn options(profile: ProfileArg, tempo: TempoArg) -> Options {
+    Options {
+        profile: match profile {
+            ProfileArg::Default => Profile::Default,
+            ProfileArg::Edm => Profile::Edm,
+        },
+        tempo: match tempo {
+            TempoArg::Constant => TempoMode::Constant,
+            TempoArg::Auto => TempoMode::Auto,
+            TempoArg::Variable => TempoMode::Variable,
+        },
     }
 }
 
@@ -154,6 +179,7 @@ struct JsonRow<'a> {
     bpm: Option<f64>,
     first_beat: Option<f64>,
     first_downbeat: Option<f64>,
+    segments: Option<&'a SegmentedGrid>,
     duration: f64,
     review: &'a [String],
     analysis: &'a Analysis,
@@ -163,6 +189,16 @@ struct JsonRow<'a> {
 struct JsonError<'a> {
     file: String,
     error: &'a str,
+}
+
+/// Segments for the CSV: `start@bpm` each (`start@bpm/beat` when one does not start on a
+/// downbeat), separated by spaces.
+fn segments_field(segments: &SegmentedGrid) -> String {
+    let one = |s: &beatgrid::Segment| match s.beat_in_bar {
+        1 => format!("{:.6}@{}", s.start, s.bpm),
+        b => format!("{:.6}@{}/{b}", s.start, s.bpm),
+    };
+    segments.segments().iter().map(one).collect::<Vec<_>>().join(" ")
 }
 
 /// A CSV field, quoted when it needs to be.
@@ -183,7 +219,7 @@ impl Table {
     fn header(&self) -> Option<String> {
         match self.format {
             Format::Text => Some(format!("{:<w$}  {:>8}  {:>8}  REVIEW", "FILE", "BPM", "DOWNBEAT", w = self.file_width)),
-            Format::Csv => Some("file,bpm,first_beat,first_downbeat,duration,review,error".to_string()),
+            Format::Csv => Some("file,bpm,first_beat,first_downbeat,duration,review,error,segments".to_string()),
             Format::Json => None,
         }
     }
@@ -197,6 +233,7 @@ impl Table {
                 bpm: grid.map(|g| g.bpm),
                 first_beat: grid.map(|g| g.first_beat()),
                 first_downbeat: grid.map(|g| g.first_downbeat()),
+                segments: a.segments.as_ref(),
                 duration: a.duration,
                 review: &a.review,
                 analysis: a,
@@ -205,38 +242,57 @@ impl Table {
             (Format::Csv, Ok(a)) => {
                 let num = |v: Option<f64>| v.map(|v| format!("{v:.6}")).unwrap_or_default();
                 format!(
-                    "{},{},{},{},{:.3},{},",
+                    "{},{},{},{},{:.3},{},,{}",
                     csv(&name),
                     grid.map(|g| g.bpm.to_string()).unwrap_or_default(),
                     num(grid.map(|g| g.first_beat())),
                     num(grid.map(|g| g.first_downbeat())),
                     a.duration,
-                    csv(&a.review.join("; "))
+                    csv(&a.review.join("; ")),
+                    a.segments.as_ref().map(segments_field).unwrap_or_default()
                 )
             }
-            (Format::Csv, Err(e)) => format!("{},,,,,,{}", csv(&name), csv(&format!("{e:#}"))),
+            (Format::Csv, Err(e)) => format!("{},,,,,,{},", csv(&name), csv(&format!("{e:#}"))),
             (Format::Text, _) => {
-                let (bpm, down) = match grid {
-                    Some(g) => (format!("{:.3}", g.bpm), format!("{:.3}", g.first_downbeat())),
-                    None => ("-".to_string(), "-".to_string()),
+                let segmented = result.as_ref().ok().and_then(|a| a.segments.as_ref()).filter(|s| !s.is_constant());
+                let (bpm, down) = match (segmented, grid) {
+                    // A grid in segments: its first segment here, the others on lines of their own.
+                    (Some(s), _) => (format!("{:.3}", s.segments()[0].bpm), format!("{:.3}", s.first_downbeat())),
+                    (None, Some(g)) => (format!("{:.3}", g.bpm), format!("{:.3}", g.first_downbeat())),
+                    (None, None) => ("-".to_string(), "-".to_string()),
                 };
                 let review = match result {
                     Err(e) => format!("error: {e:#}"),
                     Ok(a) if a.review.is_empty() => "ok".to_string(),
                     Ok(a) => a.review.join("; "),
                 };
-                format!("{name:<w$}  {bpm:>8}  {down:>8}  {review}", w = self.file_width)
+                let mut line = format!("{name:<w$}  {bpm:>8}  {down:>8}  {review}", w = self.file_width);
+                for (i, s) in segmented.map(|s| s.segments()).unwrap_or_default().iter().enumerate().skip(1) {
+                    let at = segmented.unwrap();
+                    let from = match s.beat_in_bar {
+                        1 => format!("from bar {}", at.start_bar(i)),
+                        b => format!("from bar {} beat {b}", at.start_bar(i)),
+                    };
+                    line += &format!("\n{:<w$}  {:>8.3}  {:>8.3}  {from}", "", s.bpm, s.start, w = self.file_width);
+                }
+                line
             }
         })
     }
 }
 
 fn analyze(
-    files: Vec<PathBuf>, format: Option<Format>, profile: ProfileArg, jobs: Option<usize>, activations_dir: Option<PathBuf>,
+    files: Vec<PathBuf>, format: Option<Format>, options: Options, jobs: Option<usize>, activations_dir: Option<PathBuf>,
+    overrides: Vec<String>,
 ) -> Result<ExitCode> {
     let stdout_tty = io::stdout().is_terminal();
     let format = format.unwrap_or(if stdout_tty { Format::Text } else { Format::Json });
-    let analyzer = Analyzer::with_options(profile.into())?;
+    let mut params = options.params();
+    for item in &overrides {
+        let (key, value) = item.split_once('=').ok_or_else(|| anyhow!("--param {item}: expected KEY=VALUE"))?;
+        params.set(key, value)?;
+    }
+    let analyzer = Analyzer::with_params(params)?;
     let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs.unwrap_or(0)).build()?;
     let run = |file: &Path| -> Result<Analysis> {
         let Some(dir) = &activations_dir else {
@@ -313,9 +369,9 @@ fn analyze(
     Ok(ExitCode::SUCCESS)
 }
 
-fn beats(file: PathBuf, format: BeatsFormat, profile: ProfileArg) -> Result<()> {
-    let analysis = Analyzer::with_options(profile.into())?.analyze_file(&file)?;
-    let grid = analysis.grid.ok_or_else(|| anyhow!("{}: no steady beat to grid", file.display()))?;
+fn beats(file: PathBuf, format: BeatsFormat, options: Options) -> Result<()> {
+    let analysis = Analyzer::with_options(options)?.analyze_file(&file)?;
+    let grid = analysis.segments.as_ref().ok_or_else(|| anyhow!("{}: no steady beat to grid", file.display()))?;
     if analysis.needs_review() {
         eprintln!("beatgrid: {}: worth checking by ear: {}", file.display(), analysis.review.join("; "));
     }
@@ -345,10 +401,10 @@ fn beats(file: PathBuf, format: BeatsFormat, profile: ProfileArg) -> Result<()> 
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Command::Analyze { files, format, profile, jobs, activations_dir } => {
-            return analyze(files, format, profile, jobs, activations_dir)
+        Command::Analyze { files, format, profile, tempo, jobs, activations_dir, params } => {
+            return analyze(files, format, options(profile, tempo), jobs, activations_dir, params)
         }
-        Command::Beats { file, format, profile } => beats(file, format, profile)?,
+        Command::Beats { file, format, profile, tempo } => beats(file, format, options(profile, tempo))?,
         Command::Decode { file } => write_f32le(&beatgrid::audio::decode(&file)?.samples)?,
         Command::Activations { file } => {
             let audio = beatgrid::audio::decode(&file)?;
@@ -391,8 +447,10 @@ mod tests {
     use super::*;
 
     fn analysis(review: &[&str]) -> Analysis {
+        let grid = beatgrid::Grid { bpm: 128.0, downbeat: -0.5 };
         Analysis {
-            grid: Some(beatgrid::Grid { bpm: 128.0, downbeat: -0.5 }),
+            grid: Some(grid),
+            segments: Some(grid.into()),
             duration: 180.0,
             review: review.iter().map(|r| r.to_string()).collect(),
             diagnostics: None,
@@ -420,8 +478,11 @@ mod tests {
         assert!(text.row(&files[1], &failed).unwrap().ends_with("-         -  error: no such file"));
 
         let csv = Table::new(Format::Csv, &files);
-        assert_eq!(csv.row(&files[1], &flagged).unwrap(), "longer name.mp3,128,0.437500,1.375000,180.000,tempo may change; bar 1 unclear,");
-        assert_eq!(csv.row(&files[0], &failed).unwrap(), "a.mp3,,,,,,no such file");
+        assert_eq!(
+            csv.row(&files[1], &flagged).unwrap(),
+            "longer name.mp3,128,0.437500,1.375000,180.000,tempo may change; bar 1 unclear,,1.375000@128"
+        );
+        assert_eq!(csv.row(&files[0], &failed).unwrap(), "a.mp3,,,,,,no such file,");
 
         let json = Table::new(Format::Json, &files);
         let v: serde_json::Value = serde_json::from_str(&json.row(&files[0], &ok).unwrap()).unwrap();
@@ -433,13 +494,38 @@ mod tests {
     }
 
     #[test]
+    fn segments_print_in_every_format() {
+        let files = [PathBuf::from("edit.mp3")];
+        let segmented = beatgrid::SegmentedGrid::new(vec![
+            beatgrid::Segment { start: 0.5, bpm: 124.0, beat_in_bar: 1 },
+            beatgrid::Segment { start: 60.5, bpm: 150.0, beat_in_bar: 1 },
+        ])
+        .unwrap();
+        let mut a = analysis(&[beatgrid::fit::TEMPO_SEGMENTS]);
+        a.segments = Some(segmented);
+        let ok = Ok(a);
+        let text = Table::new(Format::Text, &files).row(&files[0], &ok).unwrap();
+        assert_eq!(
+            text,
+            format!("edit.mp3   124.000     0.500  {}\n           150.000    60.500  from bar 32", beatgrid::fit::TEMPO_SEGMENTS)
+        );
+        let csv = Table::new(Format::Csv, &files).row(&files[0], &ok).unwrap();
+        assert!(csv.ends_with(",,0.500000@124 60.500000@150"), "{csv}");
+        let v: serde_json::Value = serde_json::from_str(&Table::new(Format::Json, &files).row(&files[0], &ok).unwrap()).unwrap();
+        assert_eq!(v["segments"][1]["start"], 60.5);
+        assert_eq!(v["segments"][1]["bpm"], 150.0);
+        assert_eq!(v["segments"][1]["bar"], 32);
+        assert_eq!(v["analysis"]["segments"][0]["beat_in_bar"], 1);
+    }
+
+    #[test]
     fn review_reasons_print_as_they_are() {
         let files = [PathBuf::from("a.mp3")];
         let octave = beatgrid::fit::OCTAVE_HALVED;
         let flagged = Ok(analysis(&[beatgrid::fit::NO_ATTACK, octave]));
         let both = format!("{}; {octave}", beatgrid::fit::NO_ATTACK);
         assert!(Table::new(Format::Text, &files).row(&files[0], &flagged).unwrap().ends_with(&format!("  {both}")));
-        assert!(Table::new(Format::Csv, &files).row(&files[0], &flagged).unwrap().ends_with(&format!(",{both},")));
+        assert!(Table::new(Format::Csv, &files).row(&files[0], &flagged).unwrap().ends_with(&format!(",{both},,1.375000@128")));
         let v: serde_json::Value = serde_json::from_str(&Table::new(Format::Json, &files).row(&files[0], &flagged).unwrap()).unwrap();
         assert_eq!(v["review"][1], octave);
     }

@@ -26,8 +26,12 @@
 //!
 //! - [`Analyzer::analyze_file`] decodes MP3, FLAC, WAV, Ogg Vorbis and AAC/ALAC (MP4) itself;
 //!   [`Analyzer::analyze_samples`] takes mono samples from your own decoder.
-//! - [`Options`] picks an octave convention ([`Profile`]); [`Params`] exposes every tuning
-//!   knob for experiments.
+//! - [`Options`] picks an octave convention ([`Profile`]) and whether the tempo may change
+//!   ([`TempoMode`]); [`Params`] exposes every tuning knob for experiments.
+//! - Tracks whose tempo changes (transition edits, mashups) get a [`SegmentedGrid`] in
+//!   [`Analysis::segments`] with [`TempoMode::Auto`]: constant-tempo [`Segment`]s with beats
+//!   and bars numbered on across the joins. It is always there, as one segment when the tempo
+//!   holds, so code that uses it handles both.
 //! - Times are seconds on the decoded timeline with encoder delay and padding trimmed the
 //!   way ffmpeg trims them, which is the timeline DJ software stores grids on.
 //!
@@ -43,6 +47,8 @@ pub mod dsp;
 pub mod fit;
 mod grid;
 pub mod network;
+#[doc(hidden)]
+pub mod segments;
 
 use std::fmt;
 use std::path::Path;
@@ -52,7 +58,7 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Result};
 
 pub use fit::{Diagnostics, Params};
-pub use grid::{Beat, Grid};
+pub use grid::{Beat, Grid, Segment, SegmentError, SegmentedGrid};
 
 /// Compiles the README's example with the doctests.
 #[cfg(doctest)]
@@ -110,24 +116,81 @@ impl fmt::Display for Profile {
     }
 }
 
+/// Whether a grid may change tempo partway through a track.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TempoMode {
+    /// One tempo for the whole track: a [`Grid`].
+    #[default]
+    Constant,
+    /// Constant-tempo segments where the track clearly changes tempo (a transition edit, a
+    /// mashup), one tempo everywhere else. Steady tracks keep their constant grid.
+    Auto,
+    /// Segments wherever the evidence suggests a change: for tracks known to change tempo.
+    Variable,
+}
+
+impl TempoMode {
+    /// The name [`FromStr`] accepts: "constant", "auto" or "variable".
+    pub fn name(self) -> &'static str {
+        match self {
+            TempoMode::Constant => "constant",
+            TempoMode::Auto => "auto",
+            TempoMode::Variable => "variable",
+        }
+    }
+}
+
+impl FromStr for TempoMode {
+    type Err = anyhow::Error;
+
+    /// "constant", "auto" or "variable", ignoring case.
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "constant" => Ok(TempoMode::Constant),
+            "auto" => Ok(TempoMode::Auto),
+            "variable" => Ok(TempoMode::Variable),
+            _ => bail!("unknown tempo mode {s:?} (use \"constant\", \"auto\" or \"variable\")"),
+        }
+    }
+}
+
+impl fmt::Display for TempoMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// How an [`Analyzer`] grids tracks.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     /// The octave convention.
     pub profile: Profile,
+    /// Whether the grid may change tempo (one tempo by default).
+    pub tempo: TempoMode,
+}
+
+impl Options {
+    /// The fit parameters for these options.
+    pub fn params(&self) -> Params {
+        self.profile.params().with_tempo(self.tempo)
+    }
 }
 
 impl From<Profile> for Options {
     fn from(profile: Profile) -> Self {
-        Options { profile }
+        Options { profile, ..Options::default() }
     }
 }
 
 /// What beatgrid found in a track.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Analysis {
-    /// The grid; `None` when the track has no steady beat to grid.
+    /// The best grid at one tempo; `None` when the track has no steady beat to grid.
     pub grid: Option<Grid>,
+    /// The grid to use, as constant-tempo segments: several where the track changes tempo
+    /// ([`TempoMode::Auto`] or [`TempoMode::Variable`]), otherwise one, the same beats as
+    /// `grid`. `None` when there is no grid.
+    pub segments: Option<SegmentedGrid>,
     /// Length of the decoded audio in seconds.
     pub duration: f64,
     /// Reasons a person should check the grid by ear before trusting it (a tempo that may
@@ -161,7 +224,7 @@ impl Analyzer {
 
     /// The built-in network with `options`.
     pub fn with_options(options: Options) -> Result<Self> {
-        Self::with_params(options.profile.params())
+        Self::with_params(options.params())
     }
 
     /// The built-in network with hand-tuned fit parameters.
@@ -172,7 +235,7 @@ impl Analyzer {
     /// Use `options` from now on (replacing any parameters set with
     /// [`set_params`](Self::set_params)).
     pub fn set_options(&mut self, options: Options) {
-        self.params = options.profile.params();
+        self.params = options.params();
     }
 
     /// Use hand-tuned fit parameters from now on.
@@ -233,14 +296,15 @@ impl Analyzer {
     fn fit(&self, features: &Features, beat: &[f32], downbeat: &[f32], fps: f64) -> Analysis {
         let act = fit::Activations { beat, downbeat, fps };
         let duration = features.duration;
-        match fit::fit(&act, &features.flux, &features.bands, &self.params) {
+        match fit::fit(&act, &features.flux, &features.bands, &self.params, duration) {
             Some(f) => Analysis {
                 grid: Some(f.grid),
+                segments: Some(f.segments),
                 duration,
                 review: f.review.iter().map(|r| r.to_string()).collect(),
                 diagnostics: Some(f.diagnostics),
             },
-            None => Analysis { grid: None, duration, review: vec![NO_GRID.to_string()], diagnostics: None },
+            None => Analysis { grid: None, segments: None, duration, review: vec![NO_GRID.to_string()], diagnostics: None },
         }
     }
 }
@@ -353,6 +417,46 @@ mod tests {
             assert_eq!(d.clear_stretches, 8);
             assert!(d.stretch_drift_ms.unwrap() < 2.0, "drift {:?}", d.stretch_drift_ms);
         }
+    }
+
+    #[test]
+    fn a_transition_edit_gets_two_segments_and_a_steady_track_one() {
+        let rate = 44100;
+        let auto = Analyzer::with_options(Options { tempo: TempoMode::Auto, ..Options::default() }).unwrap();
+        // 124 BPM for exactly a minute (31 bars), then the 150 BPM machine from its bar 1.
+        let mut edit = drums(124.0, 60.0, rate);
+        edit.extend(drums(150.0, 60.0, rate));
+        let a = auto.analyze_samples(&edit, rate).unwrap();
+        let segments = a.segments.as_ref().unwrap();
+        let summary: Vec<(f64, f64)> = segments.segments().iter().map(|s| (s.start, s.bpm)).collect();
+        assert_eq!(summary.len(), 2, "segments {summary:?}");
+        assert!((summary[0].1 - 124.0).abs() < 1e-6 && (summary[1].1 - 150.0).abs() < 1e-6, "{summary:?}");
+        assert!((summary[1].0 - 60.0).abs() < 0.010, "the change is at {} s", summary[1].0);
+        assert!(a.review.iter().any(|r| r == fit::TEMPO_SEGMENTS), "review {:?}", a.review);
+        // Every beat of the second machine sits on its kick, bar lines on its crashes.
+        for b in segments.beats(61.0, 119.0) {
+            let since = (b.time - 60.0) / 0.4;
+            assert!((since - since.round()).abs() * 400.0 < 10.0, "beat at {}", b.time);
+            assert_eq!(b.beat_in_bar == 1, since.round() as i64 % 4 == 0, "beat at {}", b.time);
+        }
+        // The constant grid is still there, unchanged; constant mode gives one segment.
+        assert!(a.grid.is_some());
+        let constant = Analyzer::new().unwrap().analyze_samples(&edit, rate).unwrap();
+        assert!(constant.segments.unwrap().is_constant());
+        assert_eq!(constant.grid, a.grid);
+
+        let steady = auto.analyze_samples(&drums(128.0, 120.0, rate), rate).unwrap();
+        assert!(steady.segments.as_ref().unwrap().is_constant());
+        assert_eq!(steady.segments.unwrap().constant(), steady.grid);
+    }
+
+    #[test]
+    fn tempo_modes_parse_by_name() {
+        assert_eq!("auto".parse::<TempoMode>().unwrap(), TempoMode::Auto);
+        assert_eq!("Variable".parse::<TempoMode>().unwrap(), TempoMode::Variable);
+        assert_eq!("constant".parse::<TempoMode>().unwrap(), TempoMode::default());
+        assert!("ramp".parse::<TempoMode>().is_err());
+        assert_eq!(Options::from(Profile::Edm).params().tempo, TempoMode::Constant);
     }
 
     #[test]

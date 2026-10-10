@@ -13,7 +13,8 @@ use rayon::prelude::*;
 
 use crate::bars;
 use crate::dsp::{Bands, Flux};
-use crate::Grid;
+use crate::segments::{self, SegmentSearch};
+use crate::{Grid, SegmentedGrid, TempoMode};
 
 /// The network's beat and downbeat probabilities, one per frame at `fps` frames a second.
 #[derive(Clone, Copy)]
@@ -83,6 +84,47 @@ pub struct Params {
     /// A track with an octave inside `[lo, hi)` (drum & bass at 165-185, say) is counted at
     /// half of it, as many DJs do. Checked before `octave_range`.
     pub octave_half_range: Option<(f64, f64)>,
+    /// Whether the grid may change tempo (segments.rs). The `seg_*` knobs tune the search.
+    pub tempo: TempoMode,
+    /// Windows (s) the local tempo is measured in.
+    pub seg_window_s: f64,
+    /// Hop (s) between those windows.
+    pub seg_hop_s: f64,
+    /// Step between tempo states (fraction).
+    pub seg_step: f64,
+    /// Cost (log units) of moving one tempo state between windows.
+    pub seg_drift_cost: f64,
+    /// Cost of jumping further.
+    pub seg_switch_cost: f64,
+    /// Windows whose coherence peaks below this carry no evidence.
+    pub seg_quiet: f64,
+    /// An anchor needs this much coherence at its window's tempo.
+    pub seg_anchor_min: f64,
+    /// Anchor noise (ms) for the line costs.
+    pub seg_sigma_ms: f64,
+    /// Anchors further off than this many sigmas cost no more.
+    pub seg_clip: f64,
+    /// A segment spans at least this many anchors.
+    pub seg_min_anchors: usize,
+    /// Tempo search (fraction) around a segment's line.
+    pub seg_search_span: f64,
+    /// A change is placed within this many seconds of where the lines meet.
+    pub seg_join_s: f64,
+    /// What a segmentation must show to be taken ([`Params::with_tempo`] sets these per mode).
+    /// Cost of an extra line through the anchors.
+    pub seg_penalty: f64,
+    /// A join with a smaller tempo change (fraction) is no change...
+    pub seg_min_tempo_change: f64,
+    /// ... unless a same-tempo phase jump of at least this many beats (0: never).
+    pub seg_min_jump: f64,
+    /// Every segment holds at least this many bars.
+    pub seg_min_bars: f64,
+    /// Beats where the segmented grid must be more than 10 ms from the constant one.
+    pub seg_min_apart: usize,
+    /// How much stronger the attacks on those beats must be under the segmented grid...
+    pub seg_margin: f64,
+    /// ... and how strong, over the track's median flux.
+    pub seg_min_evidence: f64,
 }
 
 impl Default for Params {
@@ -108,6 +150,26 @@ impl Default for Params {
             bar_w_fills: 1.0,
             octave_range: None,
             octave_half_range: None,
+            tempo: TempoMode::Constant,
+            seg_window_s: 16.0,
+            seg_hop_s: 4.0,
+            seg_step: 0.005,
+            seg_drift_cost: 0.5,
+            seg_switch_cost: 8.0,
+            seg_quiet: 0.3,
+            seg_anchor_min: 0.3,
+            seg_sigma_ms: 4.0,
+            seg_clip: 3.0,
+            seg_min_anchors: 4,
+            seg_search_span: 0.01,
+            seg_join_s: 8.0,
+            seg_penalty: 24.0,
+            seg_min_tempo_change: 0.001,
+            seg_min_jump: 0.0,
+            seg_min_bars: 16.0,
+            seg_min_apart: 64,
+            seg_margin: 0.25,
+            seg_min_evidence: 2.5,
         }
     }
 }
@@ -128,6 +190,51 @@ impl Params {
         self.octave_range = Some((100.0, 200.0));
         self.octave_half_range = Some((165.0, 185.0));
         self
+    }
+
+    /// A tempo mode and the segmentation knobs it uses: [`TempoMode::Variable`] looks harder
+    /// than [`TempoMode::Auto`] (the defaults), and also counts same-tempo phase jumps.
+    pub fn with_tempo(mut self, mode: TempoMode) -> Self {
+        self.tempo = mode;
+        if mode == TempoMode::Variable {
+            self.seg_penalty = 12.0;
+            self.seg_min_tempo_change = 0.0005;
+            self.seg_min_jump = 0.1;
+            self.seg_min_bars = 4.0;
+            self.seg_min_apart = 16;
+            self.seg_margin = 0.05;
+            self.seg_min_evidence = 1.5;
+        }
+        self
+    }
+
+    /// Set a numeric knob by name (research and tuning: `beatgrid analyze --param key=value`).
+    #[doc(hidden)]
+    pub fn set(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
+        let f = || value.parse::<f64>().map_err(|e| anyhow::anyhow!("{key}={value}: {e}"));
+        match key {
+            "seg_window_s" => self.seg_window_s = f()?,
+            "seg_hop_s" => self.seg_hop_s = f()?,
+            "seg_step" => self.seg_step = f()?,
+            "seg_drift_cost" => self.seg_drift_cost = f()?,
+            "seg_switch_cost" => self.seg_switch_cost = f()?,
+            "seg_quiet" => self.seg_quiet = f()?,
+            "seg_anchor_min" => self.seg_anchor_min = f()?,
+            "seg_sigma_ms" => self.seg_sigma_ms = f()?,
+            "seg_clip" => self.seg_clip = f()?,
+            "seg_min_anchors" => self.seg_min_anchors = f()? as usize,
+            "seg_search_span" => self.seg_search_span = f()?,
+            "seg_join_s" => self.seg_join_s = f()?,
+            "seg_penalty" => self.seg_penalty = f()?,
+            "seg_min_tempo_change" => self.seg_min_tempo_change = f()?,
+            "seg_min_jump" => self.seg_min_jump = f()?,
+            "seg_min_bars" => self.seg_min_bars = f()?,
+            "seg_min_apart" => self.seg_min_apart = f()? as usize,
+            "seg_margin" => self.seg_margin = f()?,
+            "seg_min_evidence" => self.seg_min_evidence = f()?,
+            _ => anyhow::bail!("unknown or non-numeric parameter {key:?}"),
+        }
+        Ok(())
     }
 }
 
@@ -174,9 +281,11 @@ pub struct Diagnostics {
     pub bar_margin: f64,
     /// Bar-1 votes by beat position, [network, arrangement changes], each summing to 1.
     pub bar_votes: [[f64; 4]; 2],
+    /// The search for tempo changes; `None` with [`TempoMode::Constant`].
+    pub segment_search: Option<SegmentSearch>,
 }
 
-fn median(v: &mut [f64]) -> f64 {
+pub(crate) fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.total_cmp(b));
     let n = v.len();
     if n == 0 {
@@ -196,7 +305,7 @@ fn arange(start: f64, stop: f64, step: f64) -> Vec<f64> {
 }
 
 /// Python's round(): halves to even.
-fn round_half_even(x: f64) -> f64 {
+pub(crate) fn round_half_even(x: f64) -> f64 {
     let r = x.round();
     if (x - x.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
         r - x.signum()
@@ -499,7 +608,7 @@ pub fn fold_period(flux: &Flux, bpm: f64) -> Vec<f64> {
     total.iter().zip(&count).map(|(t, &c)| t / c.max(1) as f64).collect()
 }
 
-fn circular_peak_height(folded: &[f64]) -> f64 {
+pub(crate) fn circular_peak_height(folded: &[f64]) -> f64 {
     let pad = 8.min(folded.len());
     let mut wrapped = folded[folded.len() - pad..].to_vec();
     wrapped.extend_from_slice(folded);
@@ -508,7 +617,7 @@ fn circular_peak_height(folded: &[f64]) -> f64 {
     s[pad..s.len() - pad].iter().copied().fold(f64::MIN, f64::max)
 }
 
-fn height_at(flux: &Flux, bpm: f64) -> f64 {
+pub(crate) fn height_at(flux: &Flux, bpm: f64) -> f64 {
     circular_peak_height(&fold_period(flux, bpm))
 }
 
@@ -556,10 +665,15 @@ pub const TEMPO_CHANGE: &str = "tempo may change";
 pub const BAR_DISAGREE: &str = "bar 1 unclear: the downbeat cues disagree";
 pub const OCTAVE_HALVED: &str = "octave chosen by the profile: the audio's pulse is twice as fast";
 pub const OCTAVE_DOUBLED: &str = "octave chosen by the profile: the audio's pulse is half as fast";
+pub const TEMPO_SEGMENTS: &str = "tempo changes: check the grid where it changes";
 
 /// The review reasons for a fit (empty: nothing looked doubtful), from its diagnostics and the
-/// grid's tempo after the octave convention.
+/// grid's tempo after the octave convention. A grid in segments gets one reason, to check the
+/// joins: the others describe a single-tempo grid.
 pub fn review(d: &Diagnostics, grid_bpm: f64) -> Vec<&'static str> {
+    if d.segment_search.as_ref().is_some_and(|s| s.accepted) {
+        return vec![TEMPO_SEGMENTS];
+    }
     let argmax = |v: &[f64; 4]| (0..4).fold(0, |b, i| if v[i] > v[b] { i } else { b });
     let mut reasons = Vec::new();
     // No usable attack: the audio could not refine the tempo, or under the final grid fewer
@@ -585,15 +699,19 @@ pub fn review(d: &Diagnostics, grid_bpm: f64) -> Vec<&'static str> {
 
 /// The result of [`fit`].
 pub struct Fitted {
-    /// The grid, after the octave convention.
+    /// The grid at one tempo, after the octave convention.
     pub grid: Grid,
+    /// The grid in constant-tempo segments (one, the same as `grid`, unless the tempo changes
+    /// and `Params::tempo` allows segments), after the octave convention.
+    pub segments: SegmentedGrid,
     /// How it was found.
     pub diagnostics: Diagnostics,
     /// Reasons to check the grid by ear; empty when nothing looked doubtful.
     pub review: Vec<&'static str>,
 }
 
-pub fn fit(act: &Activations, flux: &Flux, bands: &Bands, p: &Params) -> Option<Fitted> {
+/// Grid a track of `duration` seconds.
+pub fn fit(act: &Activations, flux: &Flux, bands: &Bands, p: &Params, duration: f64) -> Option<Fitted> {
     let bpm0 = coarse_bpm(act, p)?;
     let (bpm_activation, c0) = fit_tempo(act, bpm0, p);
     let mut bpm = bpm_activation;
@@ -649,9 +767,20 @@ pub fn fit(act: &Activations, flux: &Flux, bands: &Bands, p: &Params) -> Option<
     t0 += shift + p.offset_ms / 1000.0;
     let (stretch_drift_ms, clear_stretches) = self_audit(flux, bpm, t0);
 
-    let bar = bars::decide(act, bands, bpm, t0, p.bar_w_network, p.bar_w_changes, p.bar_w_fills);
+    let bar = bars::decide(act, bands, bpm, t0, p.bar_w_network, p.bar_w_changes, p.bar_w_fills, None);
     let downbeat = t0 + bar.rotation as f64 * period;
     let grid = Grid { bpm: apply_octave(bpm, p), downbeat };
+    let (found, segment_search) = match p.tempo {
+        TempoMode::Constant => (None, None),
+        _ => {
+            let (found, search) = segments::fit(act, flux, bands, p, bpm, downbeat, duration);
+            (found, Some(search))
+        }
+    };
+    let segments = match found {
+        Some(s) => segments::with_octave(&s, p),
+        None => SegmentedGrid::from(grid),
+    };
 
     let diagnostics = Diagnostics {
         bpm_coarse: bpm0,
@@ -672,9 +801,10 @@ pub fn fit(act: &Activations, flux: &Flux, bands: &Bands, p: &Params) -> Option<
         snap_drift_ms,
         bar_margin: bar.margin,
         bar_votes: bar.votes,
+        segment_search,
     };
     let review = review(&diagnostics, grid.bpm);
-    Some(Fitted { grid, diagnostics, review })
+    Some(Fitted { grid, segments, diagnostics, review })
 }
 
 #[cfg(test)]
@@ -753,6 +883,7 @@ mod tests {
             snap_drift_ms: 0.5,
             bar_margin: 6.0,
             bar_votes: [[0.7, 0.1, 0.1, 0.1], [0.6, 0.2, 0.1, 0.1]],
+            segment_search: None,
         }
     }
 
@@ -768,6 +899,11 @@ mod tests {
         assert_eq!(only(Diagnostics { bar_votes: disagree, ..clean() }, 128.0), [BAR_DISAGREE]);
         assert_eq!(only(Diagnostics { bpm: 174.0, ..clean() }, 87.0), [OCTAVE_HALVED]);
         assert_eq!(only(Diagnostics { bpm: 80.0, ..clean() }, 160.0), [OCTAVE_DOUBLED]);
+        // A grid in segments: check the joins (the rest describe a single-tempo grid).
+        let search = |accepted| Some(SegmentSearch { accepted, ..SegmentSearch::default() });
+        let doubtful = Diagnostics { bend_ms: 60.0, coherence_final: 0.4, ..clean() };
+        assert_eq!(only(Diagnostics { segment_search: search(true), ..doubtful.clone() }, 128.0), [TEMPO_SEGMENTS]);
+        assert_eq!(only(Diagnostics { segment_search: search(false), ..doubtful }, 128.0), [WEAK_PULSE, TEMPO_CHANGE]);
         // Measured, but not reasons on their own (docs/results.md).
         let evidence = Diagnostics {
             attack_second: 0.9,

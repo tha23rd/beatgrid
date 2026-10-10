@@ -152,6 +152,140 @@ test) that no reason flags:
   pulse, where on dev the same DJ counted six tracks with a similar half-time feel at full
   tempo (which is why a half-time flag would have been wrong six times for each catch).
 
+## Tempo changes (2026-10-10, 0.1.0)
+
+0.1.0 can grid a track whose tempo changes as constant-tempo segments (`--tempo auto` or
+`variable`; the method is step 6 of the README's "How it works", the code
+`research/beatgrid_lab/sections.py` and its port `crates/beatgrid/src/segments.rs`). The
+default stays one tempo per track. `auto` is meant to be safe on any library: it splits only
+on a clear tempo change between sections and leaves steady tracks alone. `variable` looks
+harder (a lower cost per segment, shorter segments, weaker evidence) and also follows a phase
+jump at the same tempo, for tracks known to change.
+
+**References.**
+
+- *Synthetic transition edits* (`lab splices`, `research/beatgrid_lab/splices.py`). Sections of
+  326 steady references (a grid that is one tempo, holds steady on its own audio under `lab
+  audit`, and sits on the attack: Engine, crate and Raveform tracks) are cut on their
+  downbeats and joined: two sections (60%) or three, 16-64 bars each. Joins by kind: *large*
+  (a 6-39% tempo change, 124 -> 150), *medium* (1.5-6%), *small* (0.2-1.5%, the next track
+  resampled to the ratio), *jump* (the same tempo, the next section cut a fraction of a beat
+  late) and *same* (the same tempo and phase with bar lines continuing: one grid, which must
+  not be split). Each join is a cut (a 20 ms crossfade) or a one-bar crossfade centred on the
+  change. The true grid is the source references' beats moved to where they land; a change is
+  where the next section's first beat lands. 300 dev splices are built from dev sources and
+  150 test splices from test sources. A splice is a recipe: its audio is rebuilt from the
+  source files when needed, and only features computed from it are cached.
+- *The DJ's grids with several tempo markers*: the 7 DJ-corrected Engine grids with more than
+  two markers, and one ear-approved grid of a transition edit (116.7 -> 160).
+- *Steady sets*: DJ-corrected and machine-fitted (`edm`), ear-approved (`edm`) and Raveform,
+  as in the accuracy table. A segmented grid on a reference that is one tempo throughout
+  counts as a false segmentation. Engine's own analysis on tracks played unedited (108) is an
+  extra check that was never used for tuning.
+
+**Metrics.** usable@10/@20 over the whole track: every section at the right octave, at least
+90% of the reference's beats within 10/20 ms, and bar 1 right; and the same per section.
+A change point is found when a detected change lies within one bar of a true one (matched one
+to one): recall over true changes, precision over detected ones. Each section's tempo is the
+detected tempo at the section's middle against the truth.
+
+**Synthetic transition edits.** The test split was scored once, with the settings tuned on
+dev (dev in brackets):
+
+| 150 test splices (dev: 300) | constant | auto | variable |
+|---|---|---|---|
+| usable@10, whole track | 15% (11%) | 72% (72%) | 85% (84%) |
+| usable@20, whole track | 16% (11%) | 73% (72%) | 85% (85%) |
+| sections usable@10 | 36% (33%) | 75% (78%) | 84% (86%) |
+| true changes found within a bar (recall) | 0% | 63% (64%) | 77% (77%) |
+| detected changes that are true (precision) | — | 81% (81%) | 71% (74%) |
+| sections whose tempo is within 0.01 BPM of the truth | 64% (57%) | 94% (94%) | 97% (97%) |
+| one-grid splices split | — | 0/23 (0/38) | 0/23 (0/38) |
+
+| test, usable@10 by kind | splices | constant | auto | variable |
+|---|---|---|---|---|
+| large (6-39%) | 49 | 0% | 73% | 76% |
+| medium (1.5-6%) | 26 | 0% | 88% | 88% |
+| small (0.2-1.5%) | 34 | 0% | 76% | 79% |
+| jump (same tempo, phase jumps) | 18 | 0% | 0% (by design) | 94% |
+| same (one grid) | 23 | 100% | 100% | 100% |
+| cut / one-bar crossfade | 98 / 52 | 18% / 10% | 77% / 63% | 85% / 85% |
+
+Of the true changes in splices that were segmented, the change lands on the right beat 69% of
+the time (test, auto), within a bar 84% and within two bars 89%. The misses are mostly whole
+bars off, either way: where a section ends or starts with a breakdown, or two overlap in a
+crossfade, no attack tells the old grid from the new one for a few bars, and the change can
+land anywhere in that stretch. The main failures of `auto` on dev: the gate rejecting a
+right segmentation because the new section's attacks are weak (31 of 84), phase jumps (17,
+which `auto` never follows), a missed, misplaced or merged change (15), and a wrong bar 1 in
+one section (11).
+
+**Steady sets: no regression.** With `auto`, no reference that is one tempo is segmented
+(0 of 327, dev and test), so on every one of them the grid (tempo, beats, bar 1) is the
+constant one, and usable@10 and usable@20 are unchanged on every set. The only grids `auto`
+changed are three of the DJ's grids with several markers (one now has bar 1 right).
+`constant` is the 0.0.2 code path and scores exactly as before.
+
+| dev + test | tracks (one-tempo refs) | usable@10 constant / auto / variable | false segmentations auto / variable |
+|---|---|---|---|
+| DJ-corrected (`edm`) | 66 (60) | 76% / 76% / 74% | 0 / 4 |
+| ear-approved (`edm`) | 26 (25) | 73% / 73% / 69% | 0 / 1 |
+| machine-fitted (`edm`) | 51 (51) | 84% / 84% / 84% | 0 / 0 |
+| Raveform | 218 (191) | 75% / 75% / 75% | 0 / 5 |
+| Engine's analysis, played unedited (never tuned on) | 108 (108) | 71% / 70% / 69% | 7 / 9 |
+
+On Engine's own grids `auto` segments 7 of 108. Six of them were already not usable at one
+tempo against Engine's grid: a 22-minute track at 128, 150 and 135 BPM, and tracks that go
+148 -> 125 or 150 -> 180, which Engine's analysis (always one tempo) cannot follow. One
+(136 -> 174 for the last 80 s) turns a grid that matched Engine's into one that does not;
+there the segmented grid's beats sit on attacks 3-5 times the median flux against 1.6 for
+Engine's.
+Either the track changes and Engine's grid does not follow it, or a section's strongest
+attack is not the beat: these need ears. The same holds for the few steady references that
+`variable` splits (and that `auto`'s gate rejects at the margin): on most of them the
+network's own beat activation also favours the segmented grid on the beats where it differs
+(0.78-0.95 against 0-0.35), so the activation could not tell them from true changes either.
+
+**The DJ's grids with several markers.** Against these grids no setting is usable@10 on more
+than the three that hold one tempo, but the grids themselves are approximate: on every one of
+the eight, beatgrid's beats sit on stronger attacks than the DJ's (mean flux at the beats over
+its median, DJ / beatgrid's grid).
+
+| the DJ's grid | `auto` (`variable` where different) | attacks DJ / beatgrid |
+|---|---|---|
+| transition edit, 124 -> 150 (a beatless stretch between) | 124.01 -> 150; change where the 150 BPM beats start, 27 s after the DJ's marker where the 124 BPM beats stop. Both DJ sections drift 30-170 ms against the audio | 1.3 / 5.0 |
+| mashup, 128 -> 94 -> 92 -> 125 | 128 -> 125, 20 s after the DJ's change; the slow middle section is missed | 2.9 / 4.4 |
+| 125.6 -> 126.4 | 126 -> 146 -> 126: a middle section the DJ's grid does not follow (the DJ's first section drifts 70 ms in 23 s) | 1.4 / 2.8 |
+| 116.7 -> 160 (ear-approved) | one tempo: the 160 BPM part has weak attacks (2.1 against the gate's 2.5); `variable`: 116.7 -> 160, 25 s before the DJ's change in a beatless stretch | 8.9 / 14.3 |
+| 126.25 -> 126.0 | one tempo, 126; `variable`: a phase jump at 65 s | 1.4 / 2.7 |
+| 150 with a 0.4% step near the end | one tempo, 150; usable@10 | 2.1 / 2.8 |
+| 127, followed by hand (±0.3 BPM) | one tempo, 127; usable@10 | 4.5 / 5.5 |
+| 128 with two steps of under 0.01 BPM | one tempo, 128; usable@10 | 3.3 / 4.2 |
+
+**Raveform grids that are not one tempo** (15, mostly Rekordbox grids that follow a drifting
+recording beat by beat): `auto` segments one and `variable` three; usable@10 is 1 of 15 in
+every mode (usable@20 5, 5 and 6), as one constant tempo per section cannot follow a drift.
+
+**Rust and Python.** Given the same activations, the Rust core gives the same segments as the
+research pipeline on 937 of 942 tracks with `auto` and 935 of 942 with `variable` (the
+splices, steady, real, Raveform and Engine sets, dev and test): as many segments, each at the
+same tempo and starting within 0.1 ms. The others differ by under 0.002 BPM in a tempo that
+was not snapped, by a near-tie in which downbeat a change goes on, or in whether a short
+segment is kept; every score above is the same within one section either way.
+`research/experiments/rust_parity.py --tempo auto` checks it end to end (174 of 174 Engine
+tracks the same, review reasons included).
+
+**What was tried.**
+
+| idea | result |
+|---|---|
+| each 16 s window's tempo on its own, then grouping (the first experiment) | tempos too noisy to segment on |
+| a Viterbi tempo path, then refitting each section (the second) | found the change on edits, but the refit could lock onto a neighbouring tempo; kept as stage 1, with the segments now drawn from beat anchors, which also see small changes and phase jumps |
+| evidence over the median flux >= 2.2 with the attacks twice the constant grid's | dev 68% against 72%, no fewer false segmentations |
+| segments down to 8 bars; a cost of 16 per segment; 32 differing beats | each within one splice of the defaults on dev |
+| the network's beat activation as a second vote in the gate | it favours the segments on the steady references' candidates as much as on true changes |
+| same-tempo phase jumps in `auto` | the main source of false segmentations on steady tracks (a section whose strongest attack sits a fraction of a beat off, an off-beat in a breakdown): `variable` only |
+
 ## Things that worked
 
 - **Placing the grid on the folded sub-millisecond spectral flux peak** (+2 ms): within ±5 ms
@@ -188,12 +322,11 @@ test) that no reason flags:
   tracks on the player and listening.
 
 - Octave is a convention (drum & bass at 87 or 174, dubstep at 70 or 140): use a profile.
-- Mashups and transition edits that change tempo (124 -> 150) need multi-section grids. Until
-  then they get one tempo and the review reason "tempo may change". The experiment
-  (research/beatgrid_lab/sections.py, not wired in): 16 s windows fitted independently give
-  tempos too noisy to segment on; decoded jointly (Viterbi over tempo states) they no longer
-  split steady tracks and do find the change on transition edits, but the per-section tempo
-  refit can lock to the wrong tempo, and the references disagree with the audio about where
-  the change is.
+- Tempo changes (0.1.0, above): `auto` misses changes into sections with weak attacks, never
+  follows a phase jump, and puts the change at the end of a beatless gap's old side. Gradual
+  drift (live playing, old recordings) and tempo ramps are not modelled: a constant tempo per
+  segment cannot follow them. Bar 1 is decided per segment, so a short segment's bar 1 is
+  weaker. Whether the changes `variable` finds on references marked steady are real needs
+  ears.
 - Half-time drum & bass bar phase in the `edm` profile is unresolved.
 - A few ear-approved grids sit 12-21 ms before the attack; ear approval cannot tell.

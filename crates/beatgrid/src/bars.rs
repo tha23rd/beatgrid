@@ -15,10 +15,11 @@ pub struct Decision {
     pub votes: [[f64; 4]; 2],
 }
 
-fn beat_indices(bpm: f64, t0: f64, duration: f64) -> Vec<i64> {
+/// Beat indices (from t0) of a grid's beats in [lo, hi].
+fn beat_indices(bpm: f64, t0: f64, (lo, hi): (f64, f64)) -> Vec<i64> {
     let period = 60.0 / bpm;
-    let k0 = (-t0 / period).ceil() as i64;
-    let k1 = ((duration - t0) / period).floor() as i64;
+    let k0 = ((lo - t0) / period).ceil() as i64;
+    let k1 = ((hi - t0) / period).floor() as i64;
     (k0..=k1).collect()
 }
 
@@ -33,9 +34,9 @@ fn fold4(values: &[f64], k: &[i64]) -> [f64; 4] {
     std::array::from_fn(|r| if n[r] > 0 { sum[r] / n[r] as f64 } else { 0.0 })
 }
 
-pub fn vote_network(act: &Activations, bpm: f64, t0: f64) -> [f64; 4] {
+pub fn vote_network(act: &Activations, bpm: f64, t0: f64, span: Option<(f64, f64)>) -> [f64; 4] {
     let period = 60.0 / bpm;
-    let k = beat_indices(bpm, t0, act.last_time());
+    let k = beat_indices(bpm, t0, span.unwrap_or((0.0, act.last_time())));
     let last = act.downbeat.len() as i64 - 1;
     let strength: Vec<f64> = k
         .iter()
@@ -59,11 +60,13 @@ fn robust_z(x: &[f64]) -> Vec<f64> {
     x.iter().map(|v| (v - m) / (mad + 1e-9)).collect()
 }
 
-pub fn vote_changes(bands: &Bands, bpm: f64, t0: f64) -> [f64; 4] {
+pub fn vote_changes(bands: &Bands, bpm: f64, t0: f64, span: Option<(f64, f64)>) -> [f64; 4] {
     const TOP: usize = 12;
     let period = 60.0 / bpm;
     let duration = bands.energy.len() as f64 * bands.dt;
-    let k = beat_indices(bpm, t0, duration);
+    let k = beat_indices(bpm, t0, span.unwrap_or((0.0, duration)));
+    // Over a span, the last beat ends where the span does; over the track, at its end.
+    let until = span.map_or(f64::INFINITY, |s| s.1);
     if k.len() < 32 {
         return [1.0; 4];
     }
@@ -74,7 +77,7 @@ pub fn vote_changes(bands: &Bands, bpm: f64, t0: f64) -> [f64; 4] {
     for (i, row) in bands.energy.iter().enumerate() {
         let centre = (i + 1) as f64 * bands.dt;
         let which = starts.partition_point(|&s| s < centre) as i64 - 1;
-        if which >= 0 && (which as usize) < k.len() {
+        if which >= 0 && (which as usize) < k.len() && centre < until {
             for (s, e) in sums[which as usize].iter_mut().zip(row) {
                 *s += *e as f64;
             }
@@ -118,12 +121,13 @@ pub fn vote_changes(bands: &Bands, bpm: f64, t0: f64) -> [f64; 4] {
 
 /// High-frequency onset bursts (crashes, new hat patterns) by the beat they land on: the 16
 /// beats with the most 2-10 kHz onsets above their local average vote for their position.
-pub fn vote_fills(bands: &Bands, bpm: f64, t0: f64) -> [f64; 4] {
+pub fn vote_fills(bands: &Bands, bpm: f64, t0: f64, span: Option<(f64, f64)>) -> [f64; 4] {
     const TOP: usize = 16;
     const CLICK: [usize; 3] = [8, 9, 10];
     let period = 60.0 / bpm;
     let duration = bands.energy.len() as f64 * bands.dt;
-    let k = beat_indices(bpm, t0, duration);
+    let k = beat_indices(bpm, t0, span.unwrap_or((0.0, duration)));
+    let until = span.map_or(f64::INFINITY, |s| s.1);
     if k.len() < 32 {
         return [1.0; 4];
     }
@@ -136,7 +140,7 @@ pub fn vote_fills(bands: &Bands, bpm: f64, t0: f64) -> [f64; 4] {
         let onset: f64 = CLICK.iter().map(|&b| ((row[b] - prev[b]) as f64).max(0.0)).sum();
         let centre = (i + 1) as f64 * bands.dt;
         let which = starts.partition_point(|&s| s < centre) as i64 - 1;
-        if which >= 0 && (which as usize) < k.len() {
+        if which >= 0 && (which as usize) < k.len() && centre < until {
             sums[which as usize] += onset;
             counts[which as usize] += 1;
         }
@@ -160,10 +164,16 @@ pub fn vote_fills(bands: &Bands, bpm: f64, t0: f64) -> [f64; 4] {
     votes.map(|v| v + 1e-3 * (total + 1e-9))
 }
 
-pub fn decide(act: &Activations, bands: &Bands, bpm: f64, t0: f64, w_network: f64, w_changes: f64, w_fills: f64) -> Decision {
-    let network = vote_network(act, bpm, t0);
-    let changes = vote_changes(bands, bpm, t0);
-    let fills = vote_fills(bands, bpm, t0);
+/// Bar 1 for a grid at `bpm` through `t0`, voted over the whole track or over `span` (lo, hi)
+/// of it: one segment of a track whose tempo changes.
+#[allow(clippy::too_many_arguments)]
+pub fn decide(
+    act: &Activations, bands: &Bands, bpm: f64, t0: f64, w_network: f64, w_changes: f64, w_fills: f64,
+    span: Option<(f64, f64)>,
+) -> Decision {
+    let network = vote_network(act, bpm, t0, span);
+    let changes = vote_changes(bands, bpm, t0, span);
+    let fills = vote_fills(bands, bpm, t0, span);
     let normalise = |v: [f64; 4]| {
         let v = v.map(|x| x.max(1e-9));
         let s: f64 = v.iter().sum();

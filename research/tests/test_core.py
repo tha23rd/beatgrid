@@ -160,3 +160,30 @@ def test_each_review_reason_has_its_cause():
     # Measured, but not reasons on their own (docs/results.md).
     assert review_reasons({**clean, "attack_second": 0.9, "stretch_drift_ms": 30.0, "snap_drift_ms": 30.0,
                            "bar_margin": 0.1}) == []
+
+
+def test_segmented_grid_matches_a_constant_one_and_numbers_on_across_a_change():
+    from beatgrid_lab.segmented import Segment, Segmented
+
+    # One segment is a constant grid.
+    g = Grid.constant(120.0, 0.75 - 4.0)
+    s = Segmented.constant(120.0, 0.75 - 4.0)
+    n_g, t_g = g.beats(0.0, 20.0)
+    n_s, t_s = s.beats(0.0, 20.0)
+    assert np.allclose(t_g, t_s) and np.array_equal(n_g % 4, n_s % 4)  # numbered from another origin
+    # Splitting it on a beat changes nothing.
+    split = Segmented([Segment(0.75, 120.0, 1), Segment(0.75 + 10 * 0.5, 120.0, 3)])
+    assert np.allclose(split.beats(0.0, 20.0)[1], t_s) and np.array_equal(split.beats(0.0, 20.0)[0], n_s)
+    # 124 BPM for 30 beats, then 150 from a downbeat 0.1 s late: a bar cut to two beats.
+    p = 60 / 124
+    change = 0.3 + 30 * p + 0.1
+    edit = Segmented([Segment(0.3, 124.0, 1), Segment(change, 150.0, 1)])
+    idx, t, bar, pos = edit.beat_list(13.5, change + 1.0)
+    assert idx.tolist() == [28, 29, 30, 31, 32]
+    assert bar.tolist() == [8, 8, 9, 9, 9] and pos.tolist() == [1, 2, 1, 2, 3]
+    assert t[2] == pytest.approx(change) and t[3] == pytest.approx(change + 0.4)
+    for x in (0.0, 5.0, 14.4, 14.6, change, 20.0, 100.0):
+        assert edit.time_of(edit.number_at(x))[0] == pytest.approx(x)
+    assert edit.bpm_at(change - 0.01) == 124.0 and edit.bpm_at(change) == 150.0
+    with pytest.raises(ValueError):
+        Segmented([Segment(1.0, 120.0, 1), Segment(1.2, 140.0, 1)])

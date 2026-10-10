@@ -7,9 +7,11 @@ a beat as right within ±70 ms; a grid you can mix on has to hold to about 10 ms
 whole track, and that is what beatgrid is built and measured for. It is a Rust library with
 a CLI and Python bindings, runs in about half a second per track on a laptop CPU with no ML
 runtime, and returns plain numbers (a tempo, a downbeat, every beat), so it drops into any
-app and is not tied to any DJ software's library format.
+app and is not tied to any DJ software's library format. Tracks whose tempo changes
+(transition edits, mashups) can get a grid in constant-tempo segments, the way DJ software
+stores a grid with several tempo markers.
 
-> **Status:** pre-release (0.0.2; changes in [CHANGELOG.md](CHANGELOG.md)). Not yet published
+> **Status:** pre-release (0.1.0; changes in [CHANGELOG.md](CHANGELOG.md)). Not yet published
 > to crates.io or PyPI; install from source as below.
 
 ## Install
@@ -47,9 +49,14 @@ track.flac   127.000     1.889  ok
 other.mp3    124.000     1.740  tempo may change
 
 $ beatgrid analyze --format csv track.flac other.mp3
-file,bpm,first_beat,first_downbeat,duration,review,error
-track.flac,127,0.472118,1.889441,355.778,,
-other.mp3,124,0.288236,1.739849,170.031,tempo may change,
+file,bpm,first_beat,first_downbeat,duration,review,error,segments
+track.flac,127,0.472118,1.889441,355.778,,,1.889441@127
+other.mp3,124,0.288236,1.739849,170.031,tempo may change,,1.739849@124
+
+$ beatgrid analyze --tempo auto edit.mp3
+FILE          BPM  DOWNBEAT  REVIEW
+edit.mp3  124.000     0.022  tempo changes: check the grid where it changes
+          150.000    59.886  from bar 32
 
 $ beatgrid beats track.flac | head -6
 time,bar,beat_in_bar
@@ -68,16 +75,23 @@ time,bar,beat_in_bar
 - `--profile edm` on either counts drum & bass in half time and folds everything else into
   100–200 BPM, and says so in the review reasons when that moved a track off the octave the
   audio suggests. The default keeps the octave the audio suggests.
+- `--tempo auto` on either splits the grid into constant-tempo segments where the track
+  clearly changes tempo (a transition edit, a mashup) and keeps one tempo everywhere else;
+  `--tempo variable` looks harder and also follows a phase jump at the same tempo, for tracks
+  you know change. The default, `constant`, is one tempo per track. The segments are in the
+  JSON (`segments`: `start`, `bpm`, `beat_in_bar`, and the `beat` and `bar` the segment
+  starts on) and the CSV (`segments`: `start@bpm` each, space-separated); the text table
+  shows each further segment on a line of its own, and `beatgrid beats` follows them.
 - Reads MP3, FLAC, WAV, Ogg Vorbis, and AAC/ALAC in MP4.
 
 ### Rust
 
 ```rust,no_run
-use beatgrid::{Analyzer, Options, Profile};
+use beatgrid::{Analyzer, Options, Profile, TempoMode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load the network once; an Analyzer is Send + Sync and cheap to clone.
-    let analyzer = Analyzer::with_options(Options { profile: Profile::Edm })?;
+    let analyzer = Analyzer::with_options(Options { profile: Profile::Edm, tempo: TempoMode::Constant })?;
     let analysis = analyzer.analyze_file("track.flac")?;
 
     if let Some(grid) = &analysis.grid {
@@ -89,11 +103,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if analysis.needs_review() {
         println!("worth checking by ear: {}", analysis.review.join("; "));
     }
+
+    // A track whose tempo changes: constant-tempo segments where it clearly does.
+    let analyzer = Analyzer::with_options(Options { tempo: TempoMode::Auto, ..Options::default() })?;
+    let analysis = analyzer.analyze_file("edit.mp3")?;
+    if let Some(grid) = &analysis.segments {
+        for (i, segment) in grid.segments().iter().enumerate() {
+            println!("from {:.3} s (bar {}): {} BPM", segment.start, grid.start_bar(i), segment.bpm);
+        }
+        for beat in grid.beats(0.0, analysis.duration) {
+            println!("{:.3} s  bar {} beat {}", beat.time, beat.bar, beat.beat_in_bar);
+        }
+    }
     Ok(())
 }
 ```
 
-`Analyzer::new()` uses the default profile. If you already have decoded audio, call
+`Analyzer::new()` uses the default profile and one tempo per track. If you already have decoded audio, call
 `analyzer.analyze_samples(&mono, sample_rate)`, mixing stereo to mono as (L + R) / √2 the way
 the network was trained (`beatgrid::audio::downmix` does it). `analyze_with_activations`
 takes beat and downbeat probabilities from your own network instead. API docs:
@@ -112,6 +138,10 @@ if grid:
 print(r["review"])                              # [] when nothing looked doubtful
 
 results = beatgrid.analyze_many(paths, profile="edm")  # in parallel, in the order given
+
+r = beatgrid.analyze("edit.mp3", tempo="auto")  # segments where the tempo clearly changes
+for s in r["grid"]["segments"]:                 # [{"start": 0.022, "bpm": 124.0, ...}, ...]
+    print(s["start"], s["bpm"], s["bar"])       # "beats" and "is_downbeat" follow them
 ```
 
 ## What you get
@@ -125,12 +155,19 @@ results = beatgrid.analyze_many(paths, profile="edm")  # in parallel, in the ord
 | `period()` (Rust) | seconds per beat, `60 / bpm` |
 | `beats(start, end)` | every beat in `[start, end)`, each with `time`, `index` (0 at the first downbeat, negative before it), `bar` (bar 1 starts at the first downbeat; a pickup before it is bar 0) and `beat_in_bar` (1–4, 1 = downbeat). In Python, `beats` holds the times and `is_downbeat` flags the ones |
 | `beat_number_at(t)`, `time_of_beat(n)` (Rust) | convert between a time and a (fractional) beat number |
+| `segments` | the grid to use, as constant-tempo segments (`SegmentedGrid` in Rust): several where the track changes tempo (`--tempo auto` or `variable`), otherwise one with the same beats as the constant grid. Each segment has `start` (the time of its first beat), `bpm`, and `beat_in_bar` (where that beat falls in its bar; beatgrid starts every segment on a downbeat); the JSON and Python also give the `beat` and `bar` it starts on. `beats`, `beat_number_at`, `time_of_beat`, `first_beat` and `first_downbeat` work the same on it, plus `bpm_at(t)` and `segment_at(t)` |
 | `duration` | length of the decoded audio in seconds |
 | `review` | reasons to check the grid by ear before trusting it; empty when nothing looked doubtful |
 
 Times are seconds on the decoded timeline, with encoder delay and padding trimmed the way
 ffmpeg trims them, which is the timeline DJ software stores grids on. A grid is 4/4 and
-constant: one tempo and one phase, from which every beat follows.
+constant: one tempo and one phase, from which every beat follows. A segmented grid is several
+of those one after another: segment *i* holds the beats from its `start` up to the last one
+at least half a beat before the next segment starts, the first segment also runs back before
+its start and the last one on to the end, and beat numbers and bars count on across the joins
+(a bar cut short by an edit just ends early). `bpm`, `first_beat` and `first_downbeat` at the
+top level of the CLI's and Python's output describe the best single-tempo grid (`grid`), which
+is always there too.
 
 Review reasons:
 
@@ -138,7 +175,8 @@ Review reasons:
 |---|---|
 | `no clear attack to place the grid on` | the audio's attacks do not line up into one sharp peak per beat, so the tempo comes from the network's 20 ms frames instead of the audio; or, under the final grid, fewer than 3 of the track's 8 stretches show a clear attack. Placement is less certain |
 | `weak or changing pulse` | the network's beats fit a steady pulse at the final tempo poorly |
-| `tempo may change` | some stretch of the track drifts more than 40 ms from the single tempo: a tempo change, a transition edit, or live playing |
+| `tempo may change` | some stretch of the track drifts more than 40 ms from the single tempo: a tempo change, a transition edit, or live playing. Try `--tempo auto` or `variable` |
+| `tempo changes: check the grid where it changes` | the grid is in segments (`--tempo auto` or `variable`); the joins are where it is most likely to be off |
 | `bar 1 unclear: the downbeat cues disagree` | the network's downbeats and the track's arrangement changes vote for different beats as the one |
 | `octave chosen by the profile: the audio's pulse is twice as fast` (or `half as fast`) | the profile, not the audio, set the octave (drum & bass in half time, a slow track doubled under `edm`); DJs count these both ways |
 | `no steady beat to grid` | no grid at all (silence, beatless audio) |
@@ -174,6 +212,15 @@ Raveform's labels are public, so its row can be reproduced. Where each reference
 how far it can be trusted, a whole-library comparison, and what was tried and did not work
 are in [docs/results.md](docs/results.md).
 
+**Tempo changes.** On 150 held-out synthetic transition edits (sections of the steady
+references joined at a new tempo, change points known exactly), `--tempo auto` is usable@10
+on 72% of tracks and `--tempo variable` on 85%, against 15% for one tempo; each segment's
+tempo is within 0.01 BPM of the truth for 94-97% of sections. `auto` split none of the 327
+one-tempo references in the DJ-corrected, ear-approved, machine-fitted and Raveform rows
+(`variable`: 10), whose scores it leaves unchanged; it split 7 of Engine DJ's 108 own grids,
+6 of them already wrong at one tempo. Real DJ edits and the details are in
+[docs/results.md](docs/results.md#tempo-changes-2026-10-10-010).
+
 ## How it works
 
 A DJ grid for produced music is a handful of numbers, so after a small network this is model
@@ -192,22 +239,35 @@ fitting rather than beat tracking:
    biggest arrangement changes, and high-frequency bursts.
 5. **Octave and review.** The tempo octave comes from the profile, and the reasons a DJ might
    want to listen before trusting the grid are attached.
+6. **Tempo changes** (`--tempo auto` or `variable`). The local tempo is measured in 16 s
+   windows and decoded jointly across the track; a beat anchored in each window traces beat
+   time against beat number, which is one straight line for one tempo. Where the anchors need
+   more than one line, each stretch is fitted like a whole track (tempo on the audio and
+   snapped, beats on the attack, its own bar 1), each change goes on the new segment's
+   downbeat where the attacks agree, and the segments replace the constant grid only where
+   they sit clearly better on the attacks.
 
 The Python pipeline in `research/` is the reference implementation. Given the same network
 output, the Rust core reproduces it: the same tempo, the same bar 1, beats within a
-microsecond.
+microsecond, and the same segments.
 
 ## Speed
 
 The whole pipeline (decode, network, flux, fit) takes about 0.4–0.5 s per track in batch on
 a 2019 MacBook Pro (8-core i9, no GPU); a batch of 64 tracks took 25 s. One file on its own
 takes about 1.5 s of wall time, using every core. Beat This! itself needs about 6 s per track
-on the same machine. Details are in [docs/performance.md](docs/performance.md).
+on the same machine. `--tempo auto` costs about 12% more CPU time (472 against 420 CPU
+seconds for 64 tracks; the same wall time in batch). Details are in
+[docs/performance.md](docs/performance.md).
 
 ## Limits
 
-- **One tempo per track.** Tracks whose tempo changes (transition edits, mashups, live
-  drumming) get one tempo and the review reason `tempo may change`.
+- **Tempo changes are opt-in.** By default a track gets one tempo, and the review reason
+  `tempo may change` when it does not hold one. `--tempo auto` gives transition edits and
+  mashups a grid in constant-tempo segments and leaves steady tracks alone; it follows clear
+  changes between sections, not gradual drift (live drumming, old recordings) or a phase jump
+  at the same tempo, which `--tempo variable` also follows at a higher risk of splitting a
+  track that does not change.
 - **Octave is a convention.** Drum & bass is 87 or 174 BPM and dubstep 70 or 140, depending
   on who you ask. The default keeps what the audio suggests; use `--profile edm`
   (`Profile::Edm`, `profile="edm"`) for drum & bass in half time and 100–200 BPM for the rest.
@@ -236,6 +296,8 @@ uv run lab import-raveform  # Raveform labels + audio: DATA/raveform/raveform + 
 uv run lab cache            # network activations, onset flux (slow, once)
 uv run lab audit            # which reference grids hold steady on their own audio
 uv run lab eval --split dev
+uv run lab splices          # synthetic transition edits from the steady references (no audio written)
+uv run python experiments/variable_tempo.py --split dev   # tempo changes: splices, DJ grids, steady sets
 uv run --group dev pytest -q
 ```
 
