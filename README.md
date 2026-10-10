@@ -9,8 +9,8 @@ a CLI and Python bindings, runs in about half a second per track on a laptop CPU
 runtime, and returns plain numbers (a tempo, a downbeat, every beat), so it drops into any
 app and is not tied to any DJ software's library format.
 
-> **Status:** pre-release (0.0.1). Not yet published to crates.io or PyPI; install from
-> source as below.
+> **Status:** pre-release (0.0.2; changes in [CHANGELOG.md](CHANGELOG.md)). Not yet published
+> to crates.io or PyPI; install from source as below.
 
 ## Install
 
@@ -66,7 +66,8 @@ time,bar,beat_in_bar
   reported, the rest carry on, and the exit code is 1.
 - `beatgrid beats FILE` lists every beat (`--format csv|json`).
 - `--profile edm` on either counts drum & bass in half time and folds everything else into
-  100–200 BPM. The default keeps the octave the audio suggests.
+  100–200 BPM, and says so in the review reasons when that moved a track off the octave the
+  audio suggests. The default keeps the octave the audio suggests.
 - Reads MP3, FLAC, WAV, Ogg Vorbis, and AAC/ALAC in MP4.
 
 ### Rust
@@ -135,15 +136,22 @@ Review reasons:
 
 | reason | what it means |
 |---|---|
-| `no clear attack to place the grid on` | the audio's attacks do not line up into one sharp peak per beat, so the tempo comes from the network's 20 ms frames instead of the audio, and placement is less certain |
+| `no clear attack to place the grid on` | the audio's attacks do not line up into one sharp peak per beat, so the tempo comes from the network's 20 ms frames instead of the audio; or, under the final grid, fewer than 3 of the track's 8 stretches show a clear attack. Placement is less certain |
 | `weak or changing pulse` | the network's beats fit a steady pulse at the final tempo poorly |
 | `tempo may change` | some stretch of the track drifts more than 40 ms from the single tempo: a tempo change, a transition edit, or live playing |
 | `bar 1 unclear: the downbeat cues disagree` | the network's downbeats and the track's arrangement changes vote for different beats as the one |
+| `octave chosen by the profile: the audio's pulse is twice as fast` (or `half as fast`) | the profile, not the audio, set the octave (drum & bass in half time, a slow track doubled under `edm`); DJs count these both ways |
 | `no steady beat to grid` | no grid at all (silence, beatless audio) |
 
-On reference grids that hold steady against their own audio, these flags catch about 65% of
-the wrong grids and flag about 29% of the right ones. Treat them as a listening queue, not a
-verdict.
+Against the grids DJs and experts made (DJ-corrected, ear-approved, machine-fitted and
+Raveform), these reasons are given for 48% of the grids that are not usable@10 and for 23% of
+the ones that are. Treat them as a listening queue, not a verdict: most of the disagreements
+they miss are on the reference's side (a DJ grid that drifts against its own audio, a
+download offset), and the signals tried for the rest (a second attack near the first, a grid
+that walks off the attacks, a narrow bar-1 margin) flagged usable grids at least as often as
+wrong ones. Those measurements are in the JSON output's `diagnostics` (`attack_second`,
+`stretch_drift_ms`, `snap_drift_ms`, `bar_margin`); [docs/results.md](docs/results.md#review-reasons-2026-10-09-002)
+has the numbers by failure kind.
 
 ## Accuracy
 

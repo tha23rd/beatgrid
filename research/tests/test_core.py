@@ -7,7 +7,8 @@ import pytest
 from beatgrid_lab.activations import Activations
 from beatgrid_lab.grid import Grid
 from beatgrid_lab.metrics import at_reference_octave, score
-from beatgrid_lab.pipeline import Params, attack_offset, onset_flux, run
+from beatgrid_lab import pipeline
+from beatgrid_lab.pipeline import Params, attack_offset, onset_flux, review_reasons, run, second_attack, self_audit
 from beatgrid_lab.refs.engine import decode_beat_data, to_grid
 
 
@@ -105,3 +106,57 @@ def test_flux_placement_finds_the_click_wherever_the_grid_starts():
         placed.append(start + shift)
     assert np.ptp(placed) < 0.0005
     assert -0.006 < np.mean(placed) - first < 0.0
+
+
+def flux_with_attacks(bpm, first, seconds, second=None):
+    """Onset flux as a drum loop's looks: a floor with a sharp attack on every beat, and
+    optionally a second attack `ms` later at `height` of the first (the same as the Rust test)."""
+    rate = 44100.0
+    dt, t_first, period = 32 / rate, (256 + 16) / rate, 60 / bpm
+    t = t_first + np.arange(int(seconds / dt)) * dt
+    bump = lambda at: np.exp(-0.5 * ((t - at) / 0.0008) ** 2)
+    v = 1 + 10 * bump(first + np.round((t - first) / period) * period)
+    if second:
+        ms, height = second
+        v += 10 * height * bump(first + np.round((t - first - ms / 1000) / period) * period + ms / 1000)
+    return v.astype(np.float32), dt, t_first
+
+
+def test_self_audit_holds_on_the_right_tempo_and_walks_on_a_wrong_one():
+    flux, dt, t_first = flux_with_attacks(128.0, 0.25, 240.0)
+    drift, clear = self_audit(flux, dt, t_first, 128.0, 0.25)
+    assert clear == pipeline.STRETCHES and drift < 1.0
+    # 0.02 BPM off walks ~33 ms across the track's 8 stretches.
+    drift, _ = self_audit(flux, dt, t_first, 128.02, 0.25)
+    assert drift > 25.0
+    assert self_audit(np.ones_like(flux), dt, t_first, 128.0, 0.25) == (None, 0)
+
+
+def test_a_second_attack_is_measured_against_the_first():
+    single = flux_with_attacks(126.0, 0.3, 60.0)
+    assert second_attack(*single, 126.0, 0.3, Params()) < 0.1
+    double = flux_with_attacks(126.0, 0.3, 60.0, (15.0, 0.6))
+    assert second_attack(*double, 126.0, 0.3, Params()) == pytest.approx(0.6, abs=0.1)
+    close = flux_with_attacks(126.0, 0.3, 60.0, (3.0, 0.6))  # the same attack, not a second one
+    assert second_attack(*close, 126.0, 0.3, Params()) < 0.3
+
+
+def test_each_review_reason_has_its_cause():
+    clean = dict(bpm=128.0, bpm_grid=128.0, tempo_source="flux", coherence_final=0.9, bend_ms=5.0,
+                 attack_second=0.1, stretch_drift_ms=1.0, clear_stretches=8, snap_drift_ms=0.5, bar_margin=6.0,
+                 bar_votes={"network": [0.7, 0.1, 0.1, 0.1], "changes": [0.6, 0.2, 0.1, 0.1]})
+    assert review_reasons(clean) == []
+    cases = [
+        ({"tempo_source": "activation"}, pipeline.NO_ATTACK),
+        ({"stretch_drift_ms": None, "clear_stretches": 2}, pipeline.NO_ATTACK),
+        ({"coherence_final": 0.4}, pipeline.WEAK_PULSE),
+        ({"bend_ms": 60.0}, pipeline.TEMPO_CHANGE),
+        ({"bar_votes": {"network": [0.7, 0.1, 0.1, 0.1], "changes": [0.1, 0.1, 0.7, 0.1]}}, pipeline.BAR_DISAGREE),
+        ({"bpm": 174.0, "bpm_grid": 87.0}, pipeline.OCTAVE_HALVED),
+        ({"bpm": 80.0, "bpm_grid": 160.0}, pipeline.OCTAVE_DOUBLED),
+    ]
+    for change, reason in cases:
+        assert review_reasons({**clean, **change}) == [reason], change
+    # Measured, but not reasons on their own (docs/results.md).
+    assert review_reasons({**clean, "attack_second": 0.9, "stretch_drift_ms": 30.0, "snap_drift_ms": 30.0,
+                           "bar_margin": 0.1}) == []

@@ -252,6 +252,68 @@ def attack_offset(flux: np.ndarray, dt: float, t_first: float, bpm: float, t0: f
     return (i - (len(folded) - 1) / 2) * dt, prominence
 
 
+def second_attack(flux: np.ndarray, dt: float, t_first: float, bpm: float, t0: float, params: Params) -> float:
+    """How strong the runner-up peak of the folded attack is, as a fraction of the main one
+    (both measured above the fold's median); 0 when there is none. A peak counts when it is
+    more than 5 ms from the main one and the fold dips at least 20% below it in between: a
+    second attack (a clap or a click a few ms off the kick, say) that a DJ might put the grid
+    on instead. Folded over the same window as `attack_offset`."""
+    folded = fold(flux.astype(np.float64), dt, t_first, bpm, t0, params.attack_search_ms / 1000)
+    s = _smooth(folded)
+    floor = float(np.median(folded))
+    i = int(np.argmax(s))
+    main = s[i] - floor
+    if not main > 0:
+        return 0.0
+    gap = int(round(0.005 / dt))
+    best = 0.0
+    for j in range(1, len(s) - 1):
+        if abs(j - i) <= gap or s[j] < s[j - 1] or s[j] < s[j + 1]:
+            continue
+        height = s[j] - floor
+        lo, hi = min(i, j), max(i, j)
+        if height > best and s[lo : hi + 1].min() - floor < 0.8 * height:
+            best = height
+    return float(best / main)
+
+
+# Self-audit: does the attack stay put under the grid from one end of the track to the other?
+# The check `lab audit` runs on reference grids (audit.py), here over the whole decoded track.
+STRETCHES = 8
+STRETCH_SEARCH_S = 0.06
+STRETCH_MIN_PROMINENCE = 1.5
+
+
+def self_audit(flux: np.ndarray, dt: float, t_first: float, bpm: float, t0: float) -> tuple[float | None, int]:
+    """Fold the flux around the grid's beats in each of 8 equal stretches of the track and find
+    where the attack sits. Returns (how far it walks end to end in ms, on a Theil–Sen line
+    through the stretches with a clear attack, or None when fewer than 3 have one; how many
+    stretches have a clear attack). A grid at a slightly wrong tempo walks off the attacks;
+    a right one stays put."""
+    period = 60.0 / bpm
+    duration = t_first + len(flux) * dt
+    half = int(round(STRETCH_SEARCH_S / dt))
+    xs, ys = [], []
+    for s in range(STRETCHES):
+        lo, hi = duration * s / STRETCHES, duration * (s + 1) / STRETCHES
+        k = np.arange(np.ceil((lo - t0) / period), np.ceil((hi - t0) / period))
+        centres = np.round((t0 + k * period - t_first) / dt).astype(int)
+        idx = centres[:, None] + np.arange(-half, half + 1)[None, :]
+        idx = idx[(idx[:, 0] >= 0) & (idx[:, -1] < len(flux))]
+        if len(idx) < 8:
+            continue
+        folded = flux[idx].astype(np.float64).mean(axis=0)
+        i, height = _peak(folded)
+        if height / (np.median(folded) + 1e-12) < STRETCH_MIN_PROMINENCE:
+            continue
+        xs.append(s)
+        ys.append((i - half) * dt * 1000)
+    if len(xs) < 3:
+        return None, len(xs)
+    slopes = [(ys[b] - ys[a]) / (xs[b] - xs[a]) for a in range(len(xs)) for b in range(a + 1, len(xs))]
+    return float(abs(np.median(slopes)) * (STRETCHES - 1)), len(xs)
+
+
 def fold_period(flux: np.ndarray, dt: float, t_first: float, bpm: float) -> np.ndarray:
     """Mean flux by phase within the beat, over a whole period (one bin per flux sample)."""
     period = 60.0 / bpm
@@ -314,21 +376,35 @@ def bar_phase(act: Activations, bpm: float, t0: float) -> tuple[int, float]:
     return int(order[0]), margin
 
 
+NO_ATTACK = "no clear attack to place the grid on"
+WEAK_PULSE = "weak or changing pulse"
+TEMPO_CHANGE = "tempo may change"
+BAR_DISAGREE = "bar 1 unclear: the downbeat cues disagree"
+OCTAVE_HALVED = "octave chosen by the profile: the audio's pulse is twice as fast"
+OCTAVE_DOUBLED = "octave chosen by the profile: the audio's pulse is half as fast"
+
+
 def review_reasons(diag: dict) -> list[str]:
     """Why a DJ should look at this grid before trusting it (empty: no reason found).
-    Chosen by measurement (experiments/review_signals.py, review_selfaudit.py): on references
-    the audit calls steady, these catch 65% of grids that are wrong and flag 29% of right ones.
-    An inexact tempo and a small bar margin on their own were mostly false alarms."""
+    Measured with experiments/review_flags.py; what each reason catches and costs, and the
+    signals that were tried and not kept (a second attack, a grid that walks off the attacks,
+    a narrow bar-1 margin), are in docs/results.md. Those signals stay in the diagnostics
+    (attack_second, stretch_drift_ms, snap_drift_ms, bar_margin)."""
     reasons = []
-    if diag.get("tempo_source") != "flux":
-        reasons.append("no clear attack to place the grid on")
+    # No usable attack: the audio could not refine the tempo, or under the final grid fewer
+    # than 3 of the track's 8 stretches show one.
+    if diag.get("tempo_source") != "flux" or ("clear_stretches" in diag and diag.get("stretch_drift_ms") is None):
+        reasons.append(NO_ATTACK)
     if diag.get("coherence_final", 1.0) < 0.5:
-        reasons.append("weak or changing pulse")
+        reasons.append(WEAK_PULSE)
     if diag.get("bend_ms", 0.0) > 40:
-        reasons.append("tempo may change")
+        reasons.append(TEMPO_CHANGE)
     votes = diag.get("bar_votes") or {}
     if "network" in votes and "changes" in votes and int(np.argmax(votes["network"])) != int(np.argmax(votes["changes"])):
-        reasons.append("bar 1 unclear: the downbeat cues disagree")
+        reasons.append(BAR_DISAGREE)
+    # The profile, not the audio, chose the octave: a convention DJs differ on.
+    if "bpm_grid" in diag and diag["bpm_grid"] != diag["bpm"]:
+        reasons.append(OCTAVE_HALVED if diag["bpm_grid"] < diag["bpm"] else OCTAVE_DOUBLED)
     return reasons
 
 
@@ -409,6 +485,8 @@ def run(track, params: Params = Params(), prior: Grid | None = None) -> Result:
                         continue
                     drift_ms = half_track * abs(target - bpm) / bpm * 1000
                     if drift_ms <= params.snap_free_drift_ms or height_at(target) >= height * (1 - params.snap_flux_tolerance):
+                        # How far the exact tempo walks from the measured one, end to end.
+                        diag["snap_drift_ms"] = 2 * drift_ms
                         bpm, snapped = float(target), True
                         break
     if tempo_source == "activation" and params.snap:
@@ -423,9 +501,13 @@ def run(track, params: Params = Params(), prior: Grid | None = None) -> Result:
 
     if params.placement == "flux":
         shift, prominence = attack_offset(flux, dt, t_first, bpm, t0, params)
-        diag.update(attack_shift_ms=shift * 1000, attack_prominence=prominence)
+        second = second_attack(flux, dt, t_first, bpm, t0, params)
+        diag.update(attack_shift_ms=shift * 1000, attack_prominence=prominence, attack_second=second)
         t0 += shift
     t0 += params.offset_ms / 1000
+    if flux is not None:
+        drift, clear = self_audit(flux, dt, t_first, bpm, t0)
+        diag.update(stretch_drift_ms=drift, clear_stretches=clear)
 
     phase, margin = bar_phase(act, bpm, t0)
     if params.bar_votes and hasattr(track, "band_energy"):
@@ -437,10 +519,10 @@ def run(track, params: Params = Params(), prior: Grid | None = None) -> Result:
         diag.update(bar_network=int(phase), bar_votes=decision.votes)
         phase, margin = decision.rotation, decision.margin
     diag.update(bar_margin=margin)
+    out_bpm = apply_octave(bpm, params)
+    diag["bpm_grid"] = out_bpm
     diag["review"] = review_reasons(diag)
     downbeat = t0 + phase * period
-
-    out_bpm = apply_octave(bpm, params)
     if params.follow_bends and worst > params.bend_ms and len(offsets) >= 3:
         # Markers at each stretch's centre, at the offset that stretch measured.
         k = np.round((centres - downbeat) / period)

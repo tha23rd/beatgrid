@@ -73,6 +73,85 @@ Engine in 4). Same-tempo beat placement agrees to a median of −1.2 ms across a
 both put grid lines in the same place. A 120-track stratified sample of the disagreements was
 loaded into the listening UI as a reference set named `library`, for ears to settle the rest.
 
+## Review reasons (2026-10-09, 0.0.2)
+
+`research/experiments/review_flags.py` runs the pipeline on the DJ-corrected (`edm`),
+ear-approved and machine-fitted (`edm`) and Raveform (default) references, calls a grid
+**wrong** when it is not usable@10 against its reference, and sorts each wrong grid into the
+first kind that fits: *variable tempo* (the reference's beats are not one constant tempo:
+transition edits, mashups, wobbly hand-made grids), *octave*, *tempo drift* (right octave,
+but the tempos differ by enough to walk more than 10 ms over the music), *phase offset* (same
+tempo, beats off by a constant amount) or *bar 1*. **Recall** is the share of wrong grids
+given any review reason, **false flags** the share of usable grids given one anyway. Thresholds
+were tuned on dev; the held-out test split was scored once with the dev-tuned set.
+
+| | dev 0.0.1 | dev 0.0.2 | test 0.0.1 | test 0.0.2 |
+|---|---|---|---|---|
+| recall (wrong grids) | 46% (28/61) | 52% (32/61) | 38% (9/24) | 38% (9/24) |
+| false flags (usable grids) | 23% (44/190) | 24% (45/190) | 21% (18/86) | 22% (19/86) |
+| variable tempo | 9/15 | 9/15 | 1/4 | 1/4 |
+| octave | 1/3 | 3/3 | 0/1 | 0/1 |
+| tempo drift | 5/10 | 5/10 | 1/4 | 1/4 |
+| phase offset | 8/25 | 9/25 | 6/13 | 6/13 |
+| bar 1 | 5/8 | 6/8 | 1/2 | 1/2 |
+
+On Engine's own grids for tracks a DJ played unedited (108, all splits, never used for tuning)
+both versions catch 45% (14/31) at 22% (17/77) false flags. At 20 ms instead of 10 the picture
+is the same (test: 40% recall at 22-23% false flags, both versions). The earlier figure of 65%
+caught at 29% false flags was measured with an older network and a looser label (usable@20,
+octave errors forgiven).
+
+**What was tried, and why 0.0.2 keeps only two changes.** Each change alone on top of 0.0.1's
+reasons (extra wrong grids caught / extra usable grids flagged), and all of them together as
+tuned on dev:
+
+| change | dev | test | Engine accepted |
+|---|---|---|---|
+| **kept:** "no clear attack" also when fewer than 3 of the track's 8 stretches show an attack under the grid | +1 / +0 | +0 / +0 | +0 / +0 |
+| **kept:** "octave chosen by the profile" when the profile moved the tempo off the audio's octave | +3 / +1 | +0 / +1 | +0 / +0 |
+| a second attack at least 40% of the first, more than 5 ms from it (phase) | +5 / +6 | +2 / +5 | +2 / +1 |
+| the grid walks more than 10 ms off the attacks end to end (self-audit over 8 stretches, or exact vs measured tempo) (drift) | +1 / +1 | +0 / +1 | +2 / +2 |
+| bar-1 pooled margin below 0.5 | +2 / +0 | +0 / +2 | +0 / +0 |
+| "the downbeat cues disagree" only when the margin is also below 4 | −2 / −18 | −4 / −3 | −8 / −12 |
+| all of the above, tuned on dev: recall / false flags | 57% / 18% | 29% / 27% | 29% / 10% |
+
+On dev the full set looked like 46% → 57% recall at 23% → 18% false flags; on the held-out
+test it fell to 29% recall at 27% false flags. The margin rule carried the dev gain, and it
+did not replicate: the disagreement flags it drops were right about as often on test and on
+Engine's grids as the other reasons are. The added reasons flag wrong grids at about the
+precision the existing ones do (roughly 40% pooled over the three splits, against a 25%
+base rate), so they lengthen the listening queue rather than sharpen it. 0.0.2 keeps the two
+changes that lose no wrong grid on any split and are more precise than the existing reasons
+(4 catches for 2 false flags pooled). That choice was made after the test run, so the 0.0.2
+test column above is no longer a clean held-out estimate; the clean one is the dev-tuned
+set's, which failed. The measurements behind the dropped reasons stay in the diagnostics
+(`attack_second`, `stretch_drift_ms`, `clear_stretches`, `snap_drift_ms`, `bar_margin`) for
+tools that want to rank their own queue.
+
+Signals that did not separate wrong from right grids even on dev, on top of the 0.0.2 reasons:
+octave evidence from the network (half time plausible: alternate beats below 0.8 of each
+other above 140 BPM, +0 / +6; double time plausible: off-beat activation above 0.4 below
+100 BPM, +0 / +0), a broad attack (fold over 8 ms wide, +1 / +4), and the network's beat phase
+far from the attack (+1 / +10).
+
+**Most of what the reasons miss is on the reference's side.** Of the 44 wrong grids (dev and
+test) that no reason flags:
+
+- 11 are Raveform tracks whose beats sit a constant 25-45 ms from the reference: the offset of
+  the YouTube downloads noted above, with beatgrid on the attack;
+- all 8 unflagged tempo drifts are tracks where beatgrid's own grid stays within 2 ms of the
+  attacks from one end to the other; the audit finds 6 of those references drifting on their
+  own audio, cannot check one (a DJ grid at 149.5 BPM on a track the audio puts at 150) and
+  calls one steady;
+- 9 are references that are not one constant tempo where beatgrid's single grid stays within
+  3 ms of the attacks end to end;
+- 12 are other phase offsets: 5 DJ grids a constant 11-25 ms from the attack beatgrid uses
+  (where on the attack a DJ puts the line is a convention) and 7 Raveform grids that wobble
+  around beatgrid's;
+- 3 are bar 1, and one is an octave count: a track the DJ counted at half of the audio's
+  pulse, where on dev the same DJ counted six tracks with a similar half-time feel at full
+  tempo (which is why a half-time flag would have been wrong six times for each catch).
+
 ## Things that worked
 
 - **Placing the grid on the folded sub-millisecond spectral flux peak** (+2 ms): within ±5 ms

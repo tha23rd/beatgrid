@@ -159,6 +159,17 @@ pub struct Diagnostics {
     pub attack_shift_ms: f64,
     /// Peak of the folded attack over its median.
     pub attack_prominence: f64,
+    /// Height of the runner-up peak of the folded attack, as a fraction of the main one (0:
+    /// a single attack). A second attack a few ms off the first is one a DJ might prefer.
+    pub attack_second: f64,
+    /// How far (ms) the attack walks under the grid from one end of the track to the other,
+    /// measured in 8 stretches; `None` when fewer than 3 stretches have a clear attack.
+    pub stretch_drift_ms: Option<f64>,
+    /// How many of those 8 stretches have a clear attack under the grid.
+    pub clear_stretches: usize,
+    /// How far (ms) the exact whole or half BPM walks from the tempo measured on the audio,
+    /// end to end (0 when the tempo was not snapped on the audio).
+    pub snap_drift_ms: f64,
     /// Pooled log score of bar 1 over the runner-up.
     pub bar_margin: f64,
     /// Bar-1 votes by beat position, [network, arrangement changes], each summing to 1.
@@ -379,6 +390,91 @@ pub fn attack_offset(flux: &Flux, bpm: f64, t0: f64, p: &Params) -> (f64, f64) {
     ((i - (folded.len() - 1) as f64 / 2.0) * flux.dt, prominence)
 }
 
+/// Height of the runner-up peak of the folded attack (the fold `attack_offset` measures) as a
+/// fraction of the main one, both above the fold's median; 0 when there is none. A peak counts
+/// when it is more than 5 ms from the main one and the fold dips at least 20% below it in
+/// between.
+pub fn second_attack(flux: &Flux, bpm: f64, t0: f64, p: &Params) -> f64 {
+    let folded = fold(flux, bpm, t0, p.attack_search_ms / 1000.0);
+    let s = smooth(&folded);
+    let floor = median(&mut folded.clone());
+    let i = s.iter().enumerate().fold(0, |best, (j, v)| if *v > s[best] { j } else { best });
+    let main = s[i] - floor;
+    if main.is_nan() || main <= 0.0 {
+        return 0.0;
+    }
+    let gap = round_half_even(0.005 / flux.dt) as usize;
+    let mut best = 0.0f64;
+    for j in 1..s.len().saturating_sub(1) {
+        if i.abs_diff(j) <= gap || s[j] < s[j - 1] || s[j] < s[j + 1] {
+            continue;
+        }
+        let height = s[j] - floor;
+        let dip = s[i.min(j)..=i.max(j)].iter().copied().fold(f64::INFINITY, f64::min) - floor;
+        if height > best && dip < 0.8 * height {
+            best = height;
+        }
+    }
+    best / main
+}
+
+/// Stretches of the track the self-audit folds separately.
+const STRETCHES: usize = 8;
+/// How far (s) either side of each beat the self-audit looks for the attack.
+const STRETCH_SEARCH_S: f64 = 0.06;
+/// A stretch's folded attack needs a peak this many times its median to count.
+const STRETCH_MIN_PROMINENCE: f64 = 1.5;
+
+/// Does the attack stay put under the grid from one end of the track to the other? Folds the
+/// flux around the grid's beats in each of 8 equal stretches of the track and finds the attack.
+/// Returns how far it walks end to end (ms, on a Theil-Sen line through the stretches with a
+/// clear attack; `None` when fewer than 3 have one) and how many stretches have one. A grid at
+/// a slightly wrong tempo walks off the attacks; a right one stays put. The check `lab audit`
+/// runs on reference grids, over the whole decoded track.
+pub fn self_audit(flux: &Flux, bpm: f64, t0: f64) -> (Option<f64>, usize) {
+    let period = 60.0 / bpm;
+    let duration = flux.t_first + flux.values.len() as f64 * flux.dt;
+    let half = round_half_even(STRETCH_SEARCH_S / flux.dt) as i64;
+    let width = (2 * half + 1) as usize;
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    for s in 0..STRETCHES {
+        let lo = duration * s as f64 / STRETCHES as f64;
+        let hi = duration * (s + 1) as f64 / STRETCHES as f64;
+        let mut sum = vec![0.0f64; width];
+        let mut rows = 0usize;
+        for k in ((lo - t0) / period).ceil() as i64..((hi - t0) / period).ceil() as i64 {
+            let centre = ((t0 + k as f64 * period - flux.t_first) / flux.dt).round() as i64;
+            if centre - half < 0 || centre + half >= flux.values.len() as i64 {
+                continue;
+            }
+            for (j, v) in sum.iter_mut().enumerate() {
+                *v += flux.values[(centre - half + j as i64) as usize] as f64;
+            }
+            rows += 1;
+        }
+        if rows < 8 {
+            continue;
+        }
+        sum.iter_mut().for_each(|v| *v /= rows as f64);
+        let (i, height) = peak(&sum);
+        if height / (median(&mut sum.clone()) + 1e-12) < STRETCH_MIN_PROMINENCE {
+            continue;
+        }
+        xs.push(s as f64);
+        ys.push((i - half as f64) * flux.dt * 1000.0);
+    }
+    if xs.len() < 3 {
+        return (None, xs.len());
+    }
+    let mut slopes = Vec::new();
+    for a in 0..xs.len() {
+        for b in a + 1..xs.len() {
+            slopes.push((ys[b] - ys[a]) / (xs[b] - xs[a]));
+        }
+    }
+    (Some(median(&mut slopes).abs() * (STRETCHES - 1) as f64), xs.len())
+}
+
 /// Mean flux by phase within the beat, one bin per flux sample.
 pub fn fold_period(flux: &Flux, bpm: f64) -> Vec<f64> {
     let period = 60.0 / bpm;
@@ -451,6 +547,42 @@ pub fn apply_octave(mut bpm: f64, p: &Params) -> f64 {
     bpm
 }
 
+// Review reasons: why a DJ might want to listen before trusting a grid. What each catches
+// and costs on the reference sets, and the signals that were tried and not kept, are in
+// docs/results.md (research/experiments/review_flags.py).
+pub const NO_ATTACK: &str = "no clear attack to place the grid on";
+pub const WEAK_PULSE: &str = "weak or changing pulse";
+pub const TEMPO_CHANGE: &str = "tempo may change";
+pub const BAR_DISAGREE: &str = "bar 1 unclear: the downbeat cues disagree";
+pub const OCTAVE_HALVED: &str = "octave chosen by the profile: the audio's pulse is twice as fast";
+pub const OCTAVE_DOUBLED: &str = "octave chosen by the profile: the audio's pulse is half as fast";
+
+/// The review reasons for a fit (empty: nothing looked doubtful), from its diagnostics and the
+/// grid's tempo after the octave convention.
+pub fn review(d: &Diagnostics, grid_bpm: f64) -> Vec<&'static str> {
+    let argmax = |v: &[f64; 4]| (0..4).fold(0, |b, i| if v[i] > v[b] { i } else { b });
+    let mut reasons = Vec::new();
+    // No usable attack: the audio could not refine the tempo, or under the final grid fewer
+    // than 3 of the track's 8 stretches show one.
+    if d.tempo_source != "flux" || d.stretch_drift_ms.is_none() {
+        reasons.push(NO_ATTACK);
+    }
+    if d.coherence_final < 0.5 {
+        reasons.push(WEAK_PULSE);
+    }
+    if d.bend_ms > 40.0 {
+        reasons.push(TEMPO_CHANGE);
+    }
+    if argmax(&d.bar_votes[0]) != argmax(&d.bar_votes[1]) {
+        reasons.push(BAR_DISAGREE);
+    }
+    // The profile, not the audio, chose the octave: a convention DJs differ on.
+    if grid_bpm != d.bpm {
+        reasons.push(if grid_bpm < d.bpm { OCTAVE_HALVED } else { OCTAVE_DOUBLED });
+    }
+    reasons
+}
+
 /// The result of [`fit`].
 pub struct Fitted {
     /// The grid, after the octave convention.
@@ -472,6 +604,7 @@ pub fn fit(act: &Activations, flux: &Flux, bands: &Bands, p: &Params) -> Option<
     let folded = fold_period(flux, flux_bpm);
     let prominence = circular_peak_height(&folded) / (median(&mut folded.clone()) + 1e-12);
     let mut bpm_flux = None;
+    let mut snap_drift_ms = 0.0;
     if prominence >= p.flux_min_prominence {
         bpm = flux_bpm;
         source = "flux";
@@ -485,6 +618,7 @@ pub fn fit(act: &Activations, flux: &Flux, bands: &Bands, p: &Params) -> Option<
                 }
                 let drift_ms = half_track * (target - bpm).abs() / bpm * 1000.0;
                 if drift_ms <= p.snap_free_drift_ms || height_at(flux, target) >= height * (1.0 - p.snap_flux_tolerance) {
+                    snap_drift_ms = 2.0 * drift_ms;
                     bpm = target;
                     snapped = true;
                     break;
@@ -511,46 +645,137 @@ pub fn fit(act: &Activations, flux: &Flux, bands: &Bands, p: &Params) -> Option<
     let bend_ms = bend(act, bpm, t0, p.bend_window);
 
     let (shift, attack_prominence) = attack_offset(flux, bpm, t0, p);
+    let attack_second = second_attack(flux, bpm, t0, p);
     t0 += shift + p.offset_ms / 1000.0;
+    let (stretch_drift_ms, clear_stretches) = self_audit(flux, bpm, t0);
 
     let bar = bars::decide(act, bands, bpm, t0, p.bar_w_network, p.bar_w_changes, p.bar_w_fills);
     let downbeat = t0 + bar.rotation as f64 * period;
     let grid = Grid { bpm: apply_octave(bpm, p), downbeat };
 
-    // Measured on references the audit calls steady: catches 65% of wrong grids, flags 29%
-    // of right ones (research/experiments/review_selfaudit.py).
-    let argmax = |v: &[f64; 4]| (0..4).fold(0, |b, i| if v[i] > v[b] { i } else { b });
-    let mut review = Vec::new();
-    if source != "flux" {
-        review.push("no clear attack to place the grid on");
+    let diagnostics = Diagnostics {
+        bpm_coarse: bpm0,
+        bpm_activation,
+        coherence: c0.abs(),
+        flux_prominence: Some(prominence),
+        bpm_flux,
+        bpm,
+        snapped,
+        tempo_source: source,
+        coherence_final: c.abs(),
+        bend_ms,
+        attack_shift_ms: shift * 1000.0,
+        attack_prominence,
+        attack_second,
+        stretch_drift_ms,
+        clear_stretches,
+        snap_drift_ms,
+        bar_margin: bar.margin,
+        bar_votes: bar.votes,
+    };
+    let review = review(&diagnostics, grid.bpm);
+    Some(Fitted { grid, diagnostics, review })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RATE: f64 = 44100.0;
+
+    /// Onset flux as the flux of a drum loop looks: a floor with a sharp attack on every beat at
+    /// `bpm` from `first`, and optionally a second attack `ms` later at `height` of the first.
+    fn flux_with_attacks(bpm: f64, first: f64, seconds: f64, second: Option<(f64, f64)>) -> Flux {
+        let dt = 32.0 / RATE;
+        let t_first = (256.0 + 16.0) / RATE;
+        let period = 60.0 / bpm;
+        let bump = |t: f64, at: f64| (-0.5 * ((t - at) / 0.0008).powi(2)).exp();
+        let values = (0..(seconds / dt) as usize)
+            .map(|i| {
+                let t = t_first + i as f64 * dt;
+                let beat = ((t - first) / period).round();
+                let at = first + beat * period;
+                let mut v = 1.0 + 10.0 * bump(t, at);
+                if let Some((ms, height)) = second {
+                    let k = ((t - first - ms / 1000.0) / period).round();
+                    v += 10.0 * height * bump(t, first + k * period + ms / 1000.0);
+                }
+                v as f32
+            })
+            .collect();
+        Flux { values, dt, t_first }
     }
-    if c.abs() < 0.5 {
-        review.push("weak or changing pulse");
+
+    #[test]
+    fn self_audit_holds_on_the_right_tempo_and_walks_on_a_wrong_one() {
+        let flux = flux_with_attacks(128.0, 0.25, 240.0, None);
+        let (drift, clear) = self_audit(&flux, 128.0, 0.25);
+        assert_eq!(clear, STRETCHES);
+        assert!(drift.unwrap() < 1.0, "drift {drift:?}");
+        // 0.02 BPM off walks ~33 ms across the track's 8 stretches.
+        let (drift, _) = self_audit(&flux, 128.02, 0.25);
+        assert!(drift.unwrap() > 25.0, "drift {drift:?}");
+        // No attack anywhere: no verdict.
+        let flat = Flux { values: vec![1.0; flux.values.len()], ..flux };
+        assert_eq!(self_audit(&flat, 128.0, 0.25), (None, 0));
     }
-    if bend_ms > 40.0 {
-        review.push("tempo may change");
+
+    #[test]
+    fn a_second_attack_is_measured_against_the_first() {
+        let p = Params::default();
+        let single = flux_with_attacks(126.0, 0.3, 60.0, None);
+        assert!(second_attack(&single, 126.0, 0.3, &p) < 0.1);
+        let double = flux_with_attacks(126.0, 0.3, 60.0, Some((15.0, 0.6)));
+        let ratio = second_attack(&double, 126.0, 0.3, &p);
+        assert!((ratio - 0.6).abs() < 0.1, "ratio {ratio}");
+        // Closer than 5 ms it is the same attack, not a second one.
+        let close = flux_with_attacks(126.0, 0.3, 60.0, Some((3.0, 0.6)));
+        assert!(second_attack(&close, 126.0, 0.3, &p) < 0.3);
     }
-    if argmax(&bar.votes[0]) != argmax(&bar.votes[1]) {
-        review.push("bar 1 unclear: the downbeat cues disagree");
+
+    fn clean() -> Diagnostics {
+        Diagnostics {
+            bpm_coarse: 128.0,
+            bpm_activation: 128.0,
+            coherence: 0.9,
+            flux_prominence: Some(3.0),
+            bpm_flux: Some(128.0),
+            bpm: 128.0,
+            snapped: true,
+            tempo_source: "flux",
+            coherence_final: 0.9,
+            bend_ms: 5.0,
+            attack_shift_ms: -8.0,
+            attack_prominence: 3.0,
+            attack_second: 0.1,
+            stretch_drift_ms: Some(1.0),
+            clear_stretches: 8,
+            snap_drift_ms: 0.5,
+            bar_margin: 6.0,
+            bar_votes: [[0.7, 0.1, 0.1, 0.1], [0.6, 0.2, 0.1, 0.1]],
+        }
     }
-    Some(Fitted {
-        grid,
-        diagnostics: Diagnostics {
-            bpm_coarse: bpm0,
-            bpm_activation,
-            coherence: c0.abs(),
-            flux_prominence: Some(prominence),
-            bpm_flux,
-            bpm,
-            snapped,
-            tempo_source: source,
-            coherence_final: c.abs(),
-            bend_ms,
-            attack_shift_ms: shift * 1000.0,
-            attack_prominence,
-            bar_margin: bar.margin,
-            bar_votes: bar.votes,
-        },
-        review,
-    })
+
+    #[test]
+    fn each_review_reason_has_its_cause() {
+        assert!(review(&clean(), 128.0).is_empty());
+        let only = |d: Diagnostics, grid_bpm: f64| review(&d, grid_bpm);
+        assert_eq!(only(Diagnostics { tempo_source: "activation", ..clean() }, 128.0), [NO_ATTACK]);
+        assert_eq!(only(Diagnostics { stretch_drift_ms: None, clear_stretches: 2, ..clean() }, 128.0), [NO_ATTACK]);
+        assert_eq!(only(Diagnostics { coherence_final: 0.4, ..clean() }, 128.0), [WEAK_PULSE]);
+        assert_eq!(only(Diagnostics { bend_ms: 60.0, ..clean() }, 128.0), [TEMPO_CHANGE]);
+        let disagree = [[0.7, 0.1, 0.1, 0.1], [0.1, 0.1, 0.7, 0.1]];
+        assert_eq!(only(Diagnostics { bar_votes: disagree, ..clean() }, 128.0), [BAR_DISAGREE]);
+        assert_eq!(only(Diagnostics { bpm: 174.0, ..clean() }, 87.0), [OCTAVE_HALVED]);
+        assert_eq!(only(Diagnostics { bpm: 80.0, ..clean() }, 160.0), [OCTAVE_DOUBLED]);
+        // Measured, but not reasons on their own (docs/results.md).
+        let evidence = Diagnostics {
+            attack_second: 0.9,
+            stretch_drift_ms: Some(30.0),
+            snap_drift_ms: 30.0,
+            bar_margin: 0.1,
+            ..clean()
+        };
+        assert!(review(&evidence, 128.0).is_empty());
+    }
 }

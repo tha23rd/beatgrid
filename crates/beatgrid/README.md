@@ -32,7 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `analysis.review` lists reasons to check a grid by ear (a tempo that may change, no clear
-attack, an unclear bar 1); it is empty when nothing looked doubtful.
+attack, an unclear bar 1, an octave chosen by the profile rather than the audio); it is empty
+when nothing looked doubtful.
 
 The CLI, Python bindings, accuracy figures, how it works and its limits are in the
 [repository README](https://github.com/tha23rd/beatgrid#readme).

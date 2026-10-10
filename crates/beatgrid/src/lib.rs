@@ -131,8 +131,8 @@ pub struct Analysis {
     /// Length of the decoded audio in seconds.
     pub duration: f64,
     /// Reasons a person should check the grid by ear before trusting it (a tempo that may
-    /// change, no clear attack, an unclear bar 1, no grid at all). Empty when nothing looked
-    /// doubtful.
+    /// change, no clear attack, an unclear bar 1, an octave chosen by the profile rather than
+    /// the audio, no grid at all). Empty when nothing looked doubtful.
     pub review: Vec<String>,
     /// How the grid was found, for debugging; `None` when there is no grid.
     pub diagnostics: Option<Diagnostics>,
@@ -296,6 +296,11 @@ mod tests {
     /// A drum machine: a kick on every beat, a snare on 2 and 4, a crash opening every
     /// 4-bar phrase, and hats joining after 8 bars.
     fn drums(bpm: f64, seconds: f64, rate: u32) -> Vec<f32> {
+        drums_with_flam(bpm, seconds, rate, None)
+    }
+
+    /// The same, with a clap `ms` after every kick.
+    fn drums_with_flam(bpm: f64, seconds: f64, rate: u32, clap_ms: Option<f64>) -> Vec<f32> {
         let period = 60.0 / bpm;
         let mut noise = 12345u32;
         (0..(seconds * rate as f64) as usize)
@@ -310,7 +315,11 @@ mod tests {
                 let off = since - period / 2.0;
                 let hat = if beat >= 32 && off >= 0.0 { 0.2 * white * (-off * 40.0).exp() } else { 0.0 };
                 let crash = if beat % 16 == 0 { 0.6 * white * (-since * 2.0).exp() } else { 0.0 };
-                (kick + snare + hat + crash) as f32
+                let clap = match clap_ms {
+                    Some(ms) if since >= ms / 1000.0 => 0.6 * white * (-(since - ms / 1000.0) * 60.0).exp(),
+                    _ => 0.0,
+                };
+                (kick + snare + hat + crash + clap) as f32
             })
             .collect()
     }
@@ -327,5 +336,34 @@ mod tests {
         assert!(beat_ms < 10.0, "beats {beat_ms:.1} ms off the kicks");
         let bar_ms = near_zero(grid.first_downbeat(), 4.0 * grid.period());
         assert!(bar_ms < 10.0, "bar 1 is {bar_ms:.0} ms off the crash");
+    }
+
+    #[test]
+    fn a_clap_just_after_the_kick_shows_as_a_second_attack() {
+        let analyzer = Analyzer::new().unwrap();
+        let rate = 44100;
+        let single = analyzer.analyze_samples(&drums(124.0, 60.0, rate), rate).unwrap();
+        let flam = analyzer.analyze_samples(&drums_with_flam(124.0, 60.0, rate, Some(18.0)), rate).unwrap();
+        let second = |a: &Analysis| a.diagnostics.as_ref().unwrap().attack_second;
+        assert!(second(&single) < 0.3, "single attack: {}", second(&single));
+        assert!(second(&flam) > 0.4, "kick and clap: {}", second(&flam));
+        // Both grids hold steady on the attacks from one end to the other.
+        for a in [&single, &flam] {
+            let d = a.diagnostics.as_ref().unwrap();
+            assert_eq!(d.clear_stretches, 8);
+            assert!(d.stretch_drift_ms.unwrap() < 2.0, "drift {:?}", d.stretch_drift_ms);
+        }
+    }
+
+    #[test]
+    fn the_edm_profile_says_when_it_chose_the_octave() {
+        let samples = drums(174.0, 60.0, 44100);
+        let octave = |a: &Analysis| a.review.iter().any(|r| r.starts_with("octave chosen by the profile"));
+        let a = Analyzer::new().unwrap().analyze_samples(&samples, 44100).unwrap();
+        assert!((a.grid.unwrap().bpm - 174.0).abs() < 1e-6);
+        assert!(!octave(&a), "review {:?}", a.review);
+        let a = Analyzer::with_options(Profile::Edm.into()).unwrap().analyze_samples(&samples, 44100).unwrap();
+        assert!((a.grid.unwrap().bpm - 87.0).abs() < 1e-6);
+        assert!(a.review.iter().any(|r| r == fit::OCTAVE_HALVED), "review {:?}", a.review);
     }
 }

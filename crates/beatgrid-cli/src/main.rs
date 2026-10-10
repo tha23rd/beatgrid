@@ -431,4 +431,16 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json.row(&files[0], &failed).unwrap()).unwrap();
         assert_eq!(v["error"], "no such file");
     }
+
+    #[test]
+    fn review_reasons_print_as_they_are() {
+        let files = [PathBuf::from("a.mp3")];
+        let octave = beatgrid::fit::OCTAVE_HALVED;
+        let flagged = Ok(analysis(&[beatgrid::fit::NO_ATTACK, octave]));
+        let both = format!("{}; {octave}", beatgrid::fit::NO_ATTACK);
+        assert!(Table::new(Format::Text, &files).row(&files[0], &flagged).unwrap().ends_with(&format!("  {both}")));
+        assert!(Table::new(Format::Csv, &files).row(&files[0], &flagged).unwrap().ends_with(&format!(",{both},")));
+        let v: serde_json::Value = serde_json::from_str(&Table::new(Format::Json, &files).row(&files[0], &flagged).unwrap()).unwrap();
+        assert_eq!(v["review"][1], octave);
+    }
 }
